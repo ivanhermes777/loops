@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from urllib.error import URLError
 
@@ -185,6 +186,22 @@ class AppFactoryTests(unittest.TestCase):
         self.assertIn("## Research Findings", export.content)
         self.assertFalse(hasattr(factory, "export_pdf"))
 
+    def test_history_ui_can_reopen_saved_blueprint_through_in_app_route(self):
+        app = create_app(self.storage_path, researcher=StubResearcher(self.good_findings), llm=StubLLM(self.good_blueprint))
+        result = app.factory.submit_idea("AI estimate follow-up assistant")
+
+        history_html = app.render_home()
+        self.assertIn(f'href="/blueprints/{result.id}"', history_html)
+        self.assertIn("Reopen blueprint", history_html)
+
+        body, status, headers = call_wsgi(app, "GET", f"/blueprints/{result.id}")
+
+        self.assertEqual(status, "200 OK")
+        self.assertEqual(headers["Content-Type"], "text/html; charset=utf-8")
+        self.assertIn("AI estimate follow-up assistant", body)
+        self.assertIn("Manual appointment work wastes staff time.", body)
+        self.assertIn("Completed Blueprint", body)
+
     def test_ui_html_exposes_admin_blueprint_scope_without_signup_login_pdf_or_generated_app_completion(self):
         html = create_app(self.storage_path, researcher=StubResearcher(), llm=StubLLM()).render_home()
 
@@ -196,6 +213,22 @@ class AppFactoryTests(unittest.TestCase):
         forbidden = ["Sign up", "Login", "Customer account", "PDF export", "Deploy app", "Payment setup"]
         for phrase in forbidden:
             self.assertNotIn(phrase, html)
+
+def call_wsgi(app, method, path):
+    captured = {}
+
+    def start_response(status, headers):
+        captured["status"] = status
+        captured["headers"] = dict(headers)
+
+    environ = {
+        "REQUEST_METHOD": method,
+        "PATH_INFO": path,
+        "CONTENT_LENGTH": "0",
+        "wsgi.input": BytesIO(b""),
+    }
+    body = b"".join(app(environ, start_response)).decode("utf-8")
+    return body, captured["status"], captured["headers"]
 
 
 if __name__ == "__main__":

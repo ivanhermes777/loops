@@ -397,6 +397,11 @@ class LocalApp:
                     ("Content-Disposition", f'attachment; filename="{export.filename}"'),
                 ],
             )
+        if method == "GET" and path.startswith("/blueprints/"):
+            blueprint_id = path.split("/")[2]
+            self.latest_result = self.factory.open_blueprint(blueprint_id)
+            body = self.render_home().encode("utf-8")
+            return _response(start_response, "200 OK", body, headers=[("Content-Type", "text/html; charset=utf-8")])
         body = self.render_home().encode("utf-8")
         return _response(start_response, "200 OK", body, headers=[("Content-Type", "text/html; charset=utf-8")])
 
@@ -477,6 +482,7 @@ def _history_html(state: HistoryState) -> str:
         )
     items = "".join(
         f'<li><strong>{html.escape(item.title)}</strong><span>{html.escape(item.created_at)}</span>'
+        f'<a href="/blueprints/{html.escape(item.id)}">Reopen blueprint</a>'
         f'<a href="/blueprints/{html.escape(item.id)}.md">Export Markdown</a></li>'
         for item in state.items
     )
