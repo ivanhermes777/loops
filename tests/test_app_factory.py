@@ -9,9 +9,10 @@ from unittest.mock import patch
 from loops_app.app_factory import (
     AppFactory,
     BlueprintResult,
-    DuckDuckGoResearcher,
-    LocalAIUnavailableError,
+    HermesCodexAgent,
+    HermesUnavailableError,
     ResearchFinding,
+    _parse_hermes_findings,
     create_app,
 )
 
@@ -76,7 +77,7 @@ class AppFactoryTests(unittest.TestCase):
                 "## Monetization",
                 "Monthly admin-only SaaS subscription.",
                 "## Tech Plan",
-                "Local-first Python MVP with local AI backend.",
+                "Local-first Python MVP with Hermes and OpenAI Codex OAuth.",
                 "## Launch Checklist",
                 "Interview clinics and validate pricing.",
                 "## Risks",
@@ -114,18 +115,18 @@ class AppFactoryTests(unittest.TestCase):
         self.assertEqual(reopened.blueprint_markdown, result.blueprint_markdown)
         self.assertEqual(factory.history()[0].title, "AI appointment recovery for clinics")
 
-    def test_local_llm_unavailable_fails_gracefully_with_clear_admin_error(self):
+    def test_hermes_unavailable_fails_gracefully_with_clear_admin_error(self):
         factory = AppFactory(
             self.storage_path,
             researcher=StubResearcher(self.good_findings),
-            llm=StubLLM(error=LocalAIUnavailableError("connection refused")),
+            llm=StubLLM(error=HermesUnavailableError("connection refused")),
         )
 
         result = factory.submit_idea("AI quoting tool")
 
         self.assertEqual(result.status, "error")
-        self.assertIn("local AI backend is unavailable", result.error_message)
-        self.assertIn("configured local model/service", result.error_message)
+        self.assertIn("Hermes with OpenAI Codex OAuth is unavailable", result.error_message)
+        self.assertIn("live search is enabled", result.error_message)
         self.assertEqual(factory.history(), [])
 
     def test_research_failure_preserves_partial_findings_and_offers_retry_or_ai_only_continue(self):
@@ -151,73 +152,52 @@ class AppFactoryTests(unittest.TestCase):
         self.assertTrue(continued.used_ai_only_suggestions)
         self.assertTrue(factory.history())
 
-    def test_default_duckduckgo_researcher_preserves_collected_findings_when_later_category_times_out(self):
-        researcher = DuckDuckGoResearcher()
-        calls = []
+    def test_hermes_live_search_parser_accepts_real_citations_and_rejects_placeholders(self):
+        raw = """```json
+        [
+          {"category":"pain points","summary":"Manual work is expensive.","source_title":"Operations Study","source_url":"https://research.test/ops","source_detail":"2026 survey"},
+          {"category":"urgency","summary":"Costs are rising.","source_title":"Market Report","source_url":"https://market.test/report","source_detail":"Current market data"},
+          {"category":"audience","summary":"Ignore me.","source_title":"Placeholder","source_url":"https://example.com/fake","source_detail":"Not real"}
+        ]
+        ```"""
 
-        def search_category(idea, category, suffix):
-            calls.append(category)
-            if category == "pain points":
-                return self.good_findings[:1]
-            raise TimeoutError("market scan timed out")
+        findings = _parse_hermes_findings(raw)
 
-        researcher._search_category = search_category
-        factory = AppFactory(self.storage_path, researcher=researcher, llm=StubLLM(self.good_blueprint))
+        self.assertEqual(len(findings), 2)
+        self.assertEqual(findings[0].source_title, "Operations Study")
+        self.assertEqual(findings[1].source_url, "https://market.test/report")
 
-        result = factory.submit_idea("AI review responder")
+    def test_hermes_agent_uses_web_tool_for_research_and_codex_session_for_generation(self):
+        agent = HermesCodexAgent(command="/opt/hermes", timeout_seconds=45)
+        research_json = json.dumps(
+            [
+                {
+                    "category": finding.category,
+                    "summary": finding.summary,
+                    "source_title": finding.source_title,
+                    "source_url": finding.source_url,
+                    "source_detail": finding.source_detail,
+                }
+                for finding in self.good_findings
+            ]
+        )
 
-        self.assertEqual(calls, ["pain points", "urgency"])
-        self.assertEqual(result.status, "research_warning")
-        self.assertEqual(result.research_findings, self.good_findings[:1])
-        self.assertIn("Partial findings are preserved", result.warning_message)
-        self.assertTrue(result.can_retry_research)
-        self.assertTrue(result.can_continue_with_ai_only)
+        with patch("subprocess.run") as run:
+            run.side_effect = [
+                type("Result", (), {"returncode": 0, "stdout": research_json, "stderr": ""})(),
+                type("Result", (), {"returncode": 0, "stdout": self.good_blueprint, "stderr": ""})(),
+            ]
+            findings = agent.research("AI appointment recovery")
+            blueprint = agent.generate_blueprint("AI appointment recovery", findings)
 
-    def test_default_duckduckgo_parser_extracts_current_lite_result_fixture(self):
-        fixture = Path(__file__).parent / "fixtures" / "duckduckgo_lite_results.html"
-        researcher = DuckDuckGoResearcher()
+        self.assertEqual(run.call_args_list[0].args[0][:3], ["/opt/hermes", "-t", "web"])
+        self.assertEqual(run.call_args_list[1].args[0][0], "/opt/hermes")
+        self.assertNotIn("-t", run.call_args_list[1].args[0])
+        self.assertIn("## Monetization", blueprint)
 
-        findings = researcher._parse_results(fixture.read_text(encoding="utf-8"), "pain points")
-
-        self.assertGreaterEqual(len(findings), 2)
-        first = findings[0]
-        self.assertEqual(first.category, "pain points")
-        self.assertEqual(first.source_title, "Why patients miss appointments and how practices respond")
-        self.assertEqual(first.source_url, "https://www.ama-assn.org/practice-management/digital/why-patients-miss-appointments")
-        self.assertIn("revenue leakage", first.summary)
-        self.assertIn("DuckDuckGo", first.source_detail)
-
-    def test_default_duckduckgo_search_tries_lite_fallback_when_html_has_no_results(self):
-        fixture = Path(__file__).parent / "fixtures" / "duckduckgo_lite_results.html"
-        pages = ["<html><body>No current result__a markup here.</body></html>", fixture.read_text(encoding="utf-8")]
-        opened_urls = []
-
-        class FakeResponse:
-            def __init__(self, body):
-                self.body = body.encode("utf-8")
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, traceback):
-                return False
-
-            def read(self):
-                return self.body
-
-        def fake_urlopen(request, timeout):
-            opened_urls.append(request.full_url)
-            return FakeResponse(pages.pop(0))
-
-        researcher = DuckDuckGoResearcher()
-
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            findings = researcher._search_category("AI appointment recovery", "pain points", "complaints")
-
-        self.assertEqual(len(opened_urls), 2)
-        self.assertIn("duckduckgo.com/html/", opened_urls[0])
-        self.assertIn("lite.duckduckgo.com/lite/", opened_urls[1])
-        self.assertGreaterEqual(len(findings), 2)
+    def test_invalid_hermes_live_search_contract_is_rejected(self):
+        with self.assertRaises(HermesUnavailableError):
+            _parse_hermes_findings('[{"source_url":"https://example.com/fake"}]')
 
     def test_source_evidence_links_allow_only_http_and_https_urls(self):
         valid = ResearchFinding(

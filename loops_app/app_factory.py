@@ -11,9 +11,9 @@ import html
 import json
 import os
 import re
-import socket
+import shutil
+import subprocess
 import urllib.parse
-import urllib.request
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -33,14 +33,14 @@ REQUIRED_BLUEPRINT_SECTIONS = (
     "Risks",
 )
 
-LOCAL_AI_UNAVAILABLE_MESSAGE = (
-    "The local AI backend is unavailable. Please check the configured local "
-    "model/service and make sure it is running before generating a blueprint."
+HERMES_UNAVAILABLE_MESSAGE = (
+    "Hermes with OpenAI Codex OAuth is unavailable. Confirm that Hermes is "
+    "installed, OpenAI Codex is logged in, and Hermes live search is enabled."
 )
 
 
-class LocalAIUnavailableError(RuntimeError):
-    """Raised when the configured local LLM service cannot generate text."""
+class HermesUnavailableError(RuntimeError):
+    """Raised when Hermes cannot research or generate through Codex OAuth."""
 
 
 @dataclass(frozen=True)
@@ -125,101 +125,25 @@ class LocalLLM(Protocol):
         ...
 
 
-class DuckDuckGoResearcher:
-    """Small stdlib web researcher for local/admin MVP use.
+class HermesCodexAgent:
+    """Hermes adapter backed by the user's authenticated OpenAI Codex session."""
 
-    The implementation intentionally keeps dependencies at zero for CI and local
-    setup. It fetches DuckDuckGo HTML results automatically and turns source
-    snippets into cited findings. Network failures are surfaced to the UI instead
-    of being hidden behind AI-only content.
-    """
-
-    SEARCH_CATEGORIES = (
-        ("pain points", "pain points problems complaints"),
-        ("urgency", "urgent need trend deadline cost of delay"),
-        ("audience signals", "target audience small business buyers forum"),
-        ("monetization opportunities", "pricing willingness to pay SaaS market"),
-    )
-
-    def __init__(self, timeout_seconds: float = 8.0, max_findings: int = 8):
-        self.timeout_seconds = timeout_seconds
-        self.max_findings = max_findings
+    def __init__(self, command: str | None = None, timeout_seconds: float | None = None):
+        self.command = command or os.getenv("ZELVARI_HERMES_COMMAND") or shutil.which("hermes") or "/home/hermes/.local/bin/hermes"
+        self.timeout_seconds = timeout_seconds or float(os.getenv("ZELVARI_HERMES_TIMEOUT", "360"))
 
     def research(self, idea: str) -> list[ResearchFinding]:
-        findings: list[ResearchFinding] = []
-        for category, suffix in self.SEARCH_CATEGORIES:
-            if len(findings) >= self.max_findings:
-                break
-            try:
-                findings.extend(self._search_category(idea, category, suffix))
-            except Exception as exc:
-                if findings:
-                    exc.partial_findings = findings[: self.max_findings]  # type: ignore[attr-defined]
-                raise
-        return findings[: self.max_findings]
-
-    def _search_category(self, idea: str, category: str, suffix: str) -> list[ResearchFinding]:
-        query = urllib.parse.urlencode({"q": f"{idea} {suffix}"})
-        urls = [
-            f"https://duckduckgo.com/html/?{query}",
-            f"https://lite.duckduckgo.com/lite/?{query}",
-        ]
-        last_error: Exception | None = None
-        fetched_without_results = False
-        for url in urls:
-            request = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (X11; Linux x86_64) "
-                        "AppleWebKit/537.36 ZelvariAppFactory/1.0"
-                    )
-                },
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                    page = response.read().decode("utf-8", errors="replace")
-            except Exception as exc:
-                last_error = exc
-                continue
-            findings = self._parse_results(page, category)
-            if findings:
-                return findings
-            fetched_without_results = True
-        if fetched_without_results:
-            return []
-        if last_error:
-            raise last_error
-        return []
-
-    def _parse_results(self, page: str, category: str) -> list[ResearchFinding]:
-        results: list[ResearchFinding] = []
-        blocks = _duckduckgo_result_blocks(page)
-        for raw_url, raw_title, raw_snippet in blocks[:2]:
-            title = _clean_html(raw_title)
-            snippet = _clean_html(raw_snippet)
-            source_url = _decode_duckduckgo_url(raw_url)
-            safe_source_url = _safe_source_url(source_url)
-            if title and snippet and safe_source_url:
-                results.append(
-                    ResearchFinding(
-                        category=category,
-                        summary=snippet,
-                        source_title=title,
-                        source_url=safe_source_url,
-                        source_detail="DuckDuckGo result snippet from web research",
-                    )
-                )
-        return results
-
-
-class OllamaLocalLLM:
-    """Default local LLM client for the configured local model/service."""
-
-    def __init__(self, endpoint: str | None = None, model: str | None = None, timeout_seconds: float = 60.0):
-        self.endpoint = endpoint or os.getenv("ZELVARI_LOCAL_LLM_URL", "http://127.0.0.1:11434/api/generate")
-        self.model = model or os.getenv("ZELVARI_LOCAL_LLM_MODEL", "gemma4")
-        self.timeout_seconds = timeout_seconds
+        prompt = (
+            "You are the research agent for Zelvari App Factory. Use Hermes web_search now; "
+            "do not answer from memory. Research this app idea for pain points, urgency, "
+            "audience signals, and monetization opportunities. Return ONLY a JSON array "
+            "containing 4 to 8 objects. Every object must contain the string fields category, "
+            "summary, source_title, source_url, and source_detail. source_url must be the real "
+            "http(s) URL returned by live search. Never use example.com, placeholders, invented "
+            f"sources, or Markdown fences.\n\nApp idea: {idea}"
+        )
+        raw = self._run(prompt, enable_web=True)
+        return _parse_hermes_findings(raw)
 
     def generate_blueprint(
         self,
@@ -229,22 +153,31 @@ class OllamaLocalLLM:
         allow_ai_only: bool = False,
     ) -> str:
         prompt = _blueprint_prompt(idea, findings, allow_ai_only=allow_ai_only)
-        payload = json.dumps({"model": self.model, "prompt": prompt, "stream": False}).encode("utf-8")
-        request = urllib.request.Request(
-            self.endpoint,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except (OSError, TimeoutError, socket.timeout, json.JSONDecodeError) as exc:
-            raise LocalAIUnavailableError(str(exc)) from exc
-        text = str(data.get("response", "")).strip()
-        if not text:
-            raise LocalAIUnavailableError("local model returned an empty response")
+        text = self._run(prompt, enable_web=False)
         return _ensure_blueprint_structure(text, idea, findings, allow_ai_only=allow_ai_only)
+
+    def _run(self, prompt: str, *, enable_web: bool) -> str:
+        command = [self.command]
+        if enable_web:
+            command.extend(["-t", "web"])
+        command.extend(["-z", prompt])
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise HermesUnavailableError(str(exc)) from exc
+        text = completed.stdout.strip()
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or text or f"Hermes exited with status {completed.returncode}"
+            raise HermesUnavailableError(detail)
+        if not text:
+            raise HermesUnavailableError("Hermes returned an empty response")
+        return text
 
 
 class AppFactory:
@@ -258,8 +191,9 @@ class AppFactory:
         llm: LocalLLM | None = None,
     ):
         self.storage_path = Path(storage_path)
-        self.researcher = researcher or DuckDuckGoResearcher()
-        self.llm = llm or OllamaLocalLLM()
+        default_agent = HermesCodexAgent()
+        self.researcher = researcher or default_agent
+        self.llm = llm or default_agent
         self._pending: dict[str, BlueprintResult] = {}
 
     def submit_idea(self, idea: str) -> BlueprintResult:
@@ -350,8 +284,8 @@ class AppFactory:
         findings = _sanitize_findings(findings)
         try:
             blueprint = self.llm.generate_blueprint(idea, findings, allow_ai_only=allow_ai_only)
-        except LocalAIUnavailableError:
-            return BlueprintResult(status="error", idea=idea, research_findings=findings, error_message=LOCAL_AI_UNAVAILABLE_MESSAGE)
+        except HermesUnavailableError:
+            return BlueprintResult(status="error", idea=idea, research_findings=findings, error_message=HERMES_UNAVAILABLE_MESSAGE)
         blueprint = _ensure_blueprint_structure(blueprint, idea, findings, allow_ai_only=allow_ai_only)
         result = BlueprintResult(
             id=uuid.uuid4().hex,
@@ -453,12 +387,61 @@ def _blueprint_prompt(idea: str, findings: list[ResearchFinding], *, allow_ai_on
         research_block = (research_block or "No strong cited sources available.") + "\nLabel any unsupported suggestions as AI-only."
     sections = ", ".join(REQUIRED_BLUEPRINT_SECTIONS)
     return (
-        "You are Zelvari App Factory, a local/admin-only blueprint generator. "
+        "You are Zelvari App Factory running through Hermes with OpenAI Codex OAuth. "
         "Generate a professional monetization-ready app blueprint, not finished app code.\n"
         f"Idea: {idea}\n"
         f"Cited research findings:\n{research_block}\n"
-        f"Use Markdown and include exactly these section headings: {sections}."
+        f"Use Markdown and include exactly these level-two section headings: {sections}. "
+        "Return only the blueprint Markdown."
     )
+
+
+def _parse_hermes_findings(raw: str) -> list[ResearchFinding]:
+    """Parse and validate the JSON-only live-search contract returned by Hermes."""
+    candidate = raw.strip()
+    fenced = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", candidate, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidate = fenced.group(1)
+    else:
+        start = candidate.find("[")
+        end = candidate.rfind("]")
+        if start >= 0 and end > start:
+            candidate = candidate[start : end + 1]
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise HermesUnavailableError("Hermes live search returned invalid JSON") from exc
+    if not isinstance(payload, list):
+        raise HermesUnavailableError("Hermes live search did not return a findings array")
+    findings: list[ResearchFinding] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        fields = {
+            key: str(item.get(key, "")).strip()
+            for key in ("category", "summary", "source_title", "source_url", "source_detail")
+        }
+        safe_url = _safe_source_url(fields["source_url"])
+        host = urllib.parse.urlparse(safe_url).hostname or ""
+        if (
+            not all(fields.values())
+            or not safe_url
+            or host.lower() in {"example.com", "www.example.com"}
+            or "placeholder" in safe_url.lower()
+        ):
+            continue
+        findings.append(
+            ResearchFinding(
+                category=fields["category"],
+                summary=fields["summary"],
+                source_title=fields["source_title"],
+                source_url=safe_url,
+                source_detail=fields["source_detail"],
+            )
+        )
+    if len(findings) < 2:
+        raise HermesUnavailableError("Hermes live search returned fewer than two valid cited findings")
+    return findings[:8]
 
 
 def _ensure_blueprint_structure(
@@ -527,7 +510,7 @@ def _latest_result_html(result: BlueprintResult | None) -> str:
             f"<p>{html.escape(result.warning_message)}</p>{findings}"
             '<div class="actions">'
             f'<form method="post" action="/research/retry"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Retry research</button></form>'
-            f'<form method="post" action="/research/continue-ai-only"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Continue with AI-only suggestions</button></form>'
+            f'<form method="post" action="/research/continue-ai-only"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Continue with Hermes AI-only suggestions</button></form>'
             "</div></section>"
         )
     findings = _research_list_html(result.research_findings)
@@ -634,13 +617,14 @@ def _page_template(*, history_html: str, latest_html: str) -> str:
         <div>
       <p class="eyebrow">Local/Admin Blueprint Studio</p>
       <h1>Zelvari App Factory</h1>
-      <p>Create monetization-ready app blueprints from a raw idea using automatic web research and the configured local LLM by default.</p>
+      <p>Create monetization-ready app blueprints from a raw idea using Hermes live search and your authenticated OpenAI Codex session.</p>
+      <p class="scope"><strong>Agent online:</strong> Hermes · OpenAI Codex OAuth · live web search</p>
       <p class="scope"><strong>Version 1 scope:</strong> this creates a monetization-ready blueprint, not a finished generated app. Markdown export only.</p>
       <div class="research-pipeline" aria-label="Research pipeline progress">
         <div class="pipeline-stage"><strong>Idea intake</strong><span>Capture the raw app opportunity.</span></div>
         <div class="pipeline-stage"><strong>Market scan</strong><span>Find pain and urgency signals.</span></div>
         <div class="pipeline-stage"><strong>Source review</strong><span>Surface cited evidence cards.</span></div>
-        <div class="pipeline-stage"><strong>Blueprint generation</strong><span>Use the configured local AI model.</span></div>
+        <div class="pipeline-stage"><strong>Blueprint generation</strong><span>Use Hermes with OpenAI Codex OAuth.</span></div>
         <div class="pipeline-stage"><strong>Export readiness</strong><span>Save locally and export Markdown only.</span></div>
       </div>
     </div>
@@ -648,8 +632,9 @@ def _page_template(*, history_html: str, latest_html: str) -> str:
       <p class="eyebrow">Primary Idea Flow</p>
       <label for="idea-input">App idea</label>
       <textarea id="idea-input" name="idea" placeholder="Example: AI appointment recovery assistant for small clinics"></textarea>
-      <button type="submit">Research and create blueprint</button>
-      <p>Web research runs automatically for each submission. No public accounts, hosting setup, payments, or customer login are required.</p>
+      <button type="submit" data-idle-label="Research and create blueprint">Research and create blueprint</button>
+      <p class="working-status" role="status" aria-live="polite"></p>
+      <p>Hermes live search runs automatically for each submission. No API key or Ollama service is required.</p>
     </form>
   </section>
   <section class="support-grid">
@@ -659,6 +644,21 @@ def _page_template(*, history_html: str, latest_html: str) -> str:
     </div>
   </div>
 </main>
+<script>
+  document.querySelectorAll("form").forEach((form) => {{
+    form.addEventListener("submit", () => {{
+      const button = form.querySelector("button[type=submit], button:not([type])");
+      if (!button) return;
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+      button.textContent = form.action.includes("/blueprints")
+        ? "Hermes is researching live sources…"
+        : "Hermes is working…";
+      const status = form.querySelector(".working-status");
+      if (status) status.textContent = "Searching live sources, reviewing evidence, and generating your blueprint. This can take a minute.";
+    }});
+  }});
+</script>
 </body>
 </html>"""
 
@@ -673,44 +673,6 @@ def _read_form(environ) -> dict[str, str]:
     body = environ["wsgi.input"].read(size).decode("utf-8")
     parsed = urllib.parse.parse_qs(body)
     return {key: values[0] for key, values in parsed.items()}
-
-
-def _clean_html(value: str) -> str:
-    without_tags = re.sub(r"<.*?>", " ", value)
-    return html.unescape(re.sub(r"\s+", " ", without_tags)).strip()
-
-
-def _duckduckgo_result_blocks(page: str) -> list[tuple[str, str, str]]:
-    """Extract result URL, title, and snippet from DuckDuckGo HTML variants."""
-    patterns = [
-        (
-            r'<a\b(?=[^>]*class="[^"]*result__a[^"]*")(?=[^>]*href="(?P<url>[^"]+)")[^>]*>'
-            r'(?P<title>.*?)</a>.*?'
-            r'<a\b(?=[^>]*class="[^"]*result__snippet[^"]*")[^>]*>(?P<snippet>.*?)</a>'
-        ),
-        (
-            r'<a\b(?=[^>]*class="[^"]*result-link[^"]*")(?=[^>]*href="(?P<url>[^"]+)")[^>]*>'
-            r'(?P<title>.*?)</a>.*?'
-            r'<(?:div|span|td)\b(?=[^>]*class="[^"]*result-snippet[^"]*")[^>]*>(?P<snippet>.*?)</(?:div|span|td)>'
-        ),
-    ]
-    blocks: list[tuple[str, str, str]] = []
-    seen_urls: set[str] = set()
-    for pattern in patterns:
-        for match in re.finditer(pattern, page, flags=re.DOTALL | re.IGNORECASE):
-            raw_url = match.group("url")
-            if raw_url in seen_urls:
-                continue
-            seen_urls.add(raw_url)
-            blocks.append((raw_url, match.group("title"), match.group("snippet")))
-    return blocks
-
-
-def _decode_duckduckgo_url(url: str) -> str:
-    decoded = html.unescape(url)
-    parsed = urllib.parse.urlparse(decoded)
-    query_url = urllib.parse.parse_qs(parsed.query).get("uddg", [""])[0]
-    return urllib.parse.unquote(query_url or decoded)
 
 
 def _safe_source_url(url: str) -> str:
