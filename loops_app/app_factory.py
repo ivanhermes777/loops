@@ -150,7 +150,12 @@ class DuckDuckGoResearcher:
         for category, suffix in self.SEARCH_CATEGORIES:
             if len(findings) >= self.max_findings:
                 break
-            findings.extend(self._search_category(idea, category, suffix))
+            try:
+                findings.extend(self._search_category(idea, category, suffix))
+            except Exception as exc:
+                if findings:
+                    exc.partial_findings = findings[: self.max_findings]  # type: ignore[attr-defined]
+                raise
         return findings[: self.max_findings]
 
     def _search_category(self, idea: str, category: str, suffix: str) -> list[ResearchFinding]:

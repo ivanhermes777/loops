@@ -1,0 +1,8 @@
+{
+  "command": [
+    "python3",
+    "-c",
+    "import os; from loops_app.app_factory import run; run(host='127.0.0.1', port=int(os.environ.get('PORT', '{port}')))"
+  ],
+  "path": "/"
+}

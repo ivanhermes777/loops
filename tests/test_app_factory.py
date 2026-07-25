@@ -7,6 +7,7 @@ from urllib.error import URLError
 
 from loops_app.app_factory import (
     AppFactory,
+    DuckDuckGoResearcher,
     LocalAIUnavailableError,
     ResearchFinding,
     create_app,
@@ -147,6 +148,28 @@ class AppFactoryTests(unittest.TestCase):
         self.assertEqual(continued.status, "complete")
         self.assertTrue(continued.used_ai_only_suggestions)
         self.assertTrue(factory.history())
+
+    def test_default_duckduckgo_researcher_preserves_collected_findings_when_later_category_times_out(self):
+        researcher = DuckDuckGoResearcher()
+        calls = []
+
+        def search_category(idea, category, suffix):
+            calls.append(category)
+            if category == "pain points":
+                return self.good_findings[:1]
+            raise TimeoutError("market scan timed out")
+
+        researcher._search_category = search_category
+        factory = AppFactory(self.storage_path, researcher=researcher, llm=StubLLM(self.good_blueprint))
+
+        result = factory.submit_idea("AI review responder")
+
+        self.assertEqual(calls, ["pain points", "urgency"])
+        self.assertEqual(result.status, "research_warning")
+        self.assertEqual(result.research_findings, self.good_findings[:1])
+        self.assertIn("Partial findings are preserved", result.warning_message)
+        self.assertTrue(result.can_retry_research)
+        self.assertTrue(result.can_continue_with_ai_only)
 
     def test_weak_research_returns_visible_warning_and_retry_can_complete(self):
         weak_researcher = StubResearcher([])
