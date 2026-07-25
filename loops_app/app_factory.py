@@ -160,34 +160,53 @@ class DuckDuckGoResearcher:
 
     def _search_category(self, idea: str, category: str, suffix: str) -> list[ResearchFinding]:
         query = urllib.parse.urlencode({"q": f"{idea} {suffix}"})
-        url = f"https://duckduckgo.com/html/?{query}"
-        request = urllib.request.Request(
-            url,
-            headers={"User-Agent": "ZelvariAppFactory/1.0 (+local-admin-blueprint-research)"},
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-            page = response.read().decode("utf-8", errors="replace")
-        return self._parse_results(page, category)
+        urls = [
+            f"https://duckduckgo.com/html/?{query}",
+            f"https://lite.duckduckgo.com/lite/?{query}",
+        ]
+        last_error: Exception | None = None
+        fetched_without_results = False
+        for url in urls:
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (X11; Linux x86_64) "
+                        "AppleWebKit/537.36 ZelvariAppFactory/1.0"
+                    )
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    page = response.read().decode("utf-8", errors="replace")
+            except Exception as exc:
+                last_error = exc
+                continue
+            findings = self._parse_results(page, category)
+            if findings:
+                return findings
+            fetched_without_results = True
+        if fetched_without_results:
+            return []
+        if last_error:
+            raise last_error
+        return []
 
     def _parse_results(self, page: str, category: str) -> list[ResearchFinding]:
         results: list[ResearchFinding] = []
-        blocks = re.findall(
-            r'<a rel="nofollow" class="result__a" href="(?P<url>[^"]+)">(?P<title>.*?)</a>.*?'
-            r'<a class="result__snippet".*?>(?P<snippet>.*?)</a>',
-            page,
-            flags=re.DOTALL,
-        )
+        blocks = _duckduckgo_result_blocks(page)
         for raw_url, raw_title, raw_snippet in blocks[:2]:
             title = _clean_html(raw_title)
             snippet = _clean_html(raw_snippet)
             source_url = _decode_duckduckgo_url(raw_url)
-            if title and snippet and source_url:
+            safe_source_url = _safe_source_url(source_url)
+            if title and snippet and safe_source_url:
                 results.append(
                     ResearchFinding(
                         category=category,
                         summary=snippet,
                         source_title=title,
-                        source_url=source_url,
+                        source_url=safe_source_url,
                         source_detail="DuckDuckGo result snippet from web research",
                     )
                 )
@@ -307,7 +326,7 @@ class AppFactory:
             pending_id=pending_id,
             idea=idea,
             status="research_warning",
-            research_findings=list(findings),
+            research_findings=_sanitize_findings(findings),
             warning_message=(
                 "Web research failed or returned weak results. Partial findings are preserved when available. "
                 "Retry research, or continue with clearly labeled AI-only suggestions."
@@ -328,6 +347,7 @@ class AppFactory:
         *,
         allow_ai_only: bool,
     ) -> BlueprintResult:
+        findings = _sanitize_findings(findings)
         try:
             blueprint = self.llm.generate_blueprint(idea, findings, allow_ai_only=allow_ai_only)
         except LocalAIUnavailableError:
@@ -522,17 +542,26 @@ def _latest_result_html(result: BlueprintResult | None) -> str:
 def _research_list_html(findings: list[ResearchFinding]) -> str:
     if not findings:
         return '<p class="muted">No useful cited findings were collected yet.</p>'
-    items = "".join(
+    items = "".join(_research_card_html(finding) for finding in findings)
+    return f"<h3>Cited research findings</h3><ul class=\"findings\">{items}</ul>"
+
+
+def _research_card_html(finding: ResearchFinding) -> str:
+    safe_url = _safe_source_url(finding.source_url)
+    source_action = (
+        f'<a href="{html.escape(safe_url)}">Open source</a>'
+        if safe_url
+        else '<span class="muted">Source URL unavailable or rejected for safety</span>'
+    )
+    return (
         '<li class="evidence-card">'
         f'<div><p class="eyebrow">Source type: {html.escape(finding.category.title())}</p>'
         f"<strong>{html.escape(finding.source_title)}</strong>"
         f'<span class="credibility">Credibility cue: cited web source reviewed by admin</span></div>'
         f"<p>{html.escape(finding.summary)}</p>"
-        f'<a href="{html.escape(finding.source_url)}">Open source</a>'
+        f"{source_action}"
         f'<span>{html.escape(finding.source_detail)}</span></li>'
-        for finding in findings
     )
-    return f"<h3>Cited research findings</h3><ul class=\"findings\">{items}</ul>"
 
 
 def _page_template(*, history_html: str, latest_html: str) -> str:
@@ -651,11 +680,57 @@ def _clean_html(value: str) -> str:
     return html.unescape(re.sub(r"\s+", " ", without_tags)).strip()
 
 
+def _duckduckgo_result_blocks(page: str) -> list[tuple[str, str, str]]:
+    """Extract result URL, title, and snippet from DuckDuckGo HTML variants."""
+    patterns = [
+        (
+            r'<a\b(?=[^>]*class="[^"]*result__a[^"]*")(?=[^>]*href="(?P<url>[^"]+)")[^>]*>'
+            r'(?P<title>.*?)</a>.*?'
+            r'<a\b(?=[^>]*class="[^"]*result__snippet[^"]*")[^>]*>(?P<snippet>.*?)</a>'
+        ),
+        (
+            r'<a\b(?=[^>]*class="[^"]*result-link[^"]*")(?=[^>]*href="(?P<url>[^"]+)")[^>]*>'
+            r'(?P<title>.*?)</a>.*?'
+            r'<(?:div|span|td)\b(?=[^>]*class="[^"]*result-snippet[^"]*")[^>]*>(?P<snippet>.*?)</(?:div|span|td)>'
+        ),
+    ]
+    blocks: list[tuple[str, str, str]] = []
+    seen_urls: set[str] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, page, flags=re.DOTALL | re.IGNORECASE):
+            raw_url = match.group("url")
+            if raw_url in seen_urls:
+                continue
+            seen_urls.add(raw_url)
+            blocks.append((raw_url, match.group("title"), match.group("snippet")))
+    return blocks
+
+
 def _decode_duckduckgo_url(url: str) -> str:
     decoded = html.unescape(url)
     parsed = urllib.parse.urlparse(decoded)
     query_url = urllib.parse.parse_qs(parsed.query).get("uddg", [""])[0]
     return urllib.parse.unquote(query_url or decoded)
+
+
+def _safe_source_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url.strip())
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return urllib.parse.urlunparse(parsed)
+    return ""
+
+
+def _sanitize_findings(findings: Iterable[ResearchFinding]) -> list[ResearchFinding]:
+    return [
+        ResearchFinding(
+            category=finding.category,
+            summary=finding.summary,
+            source_title=finding.source_title,
+            source_url=_safe_source_url(finding.source_url),
+            source_detail=finding.source_detail,
+        )
+        for finding in findings
+    ]
 
 
 def _slugify(value: str) -> str:

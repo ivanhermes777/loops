@@ -1,0 +1,6 @@
+{
+  "test_commands": [
+    ["python3", "-m", "unittest", "discover", "-s", "tests", "-v"],
+    ["python3", "-m", "compileall", "loops_app", "tests"]
+  ]
+}
