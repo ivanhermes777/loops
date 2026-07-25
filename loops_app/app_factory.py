@@ -475,29 +475,30 @@ def _markdown_document(result: BlueprintResult) -> str:
 def _history_html(state: HistoryState) -> str:
     if state.is_empty:
         return (
-            '<section class="panel history empty"><p class="eyebrow">Project History</p>'
+            '<aside class="history-sidebar glass-panel empty" aria-label="Project history"><p class="eyebrow">Project History</p>'
             f"<h2>{html.escape(state.heading)}</h2>"
             f"<p>{html.escape(state.description)}</p>"
-            f'<a class="primary secondary" href="#idea">{html.escape(state.primary_button_label)}</a></section>'
+            f'<a class="primary secondary" href="#idea">{html.escape(state.primary_button_label)}</a></aside>'
         )
     items = "".join(
-        f'<li><strong>{html.escape(item.title)}</strong><span>{html.escape(item.created_at)}</span>'
+        f'<li class="history-item"><span class="status-dot" aria-hidden="true"></span><div><strong>{html.escape(item.title)}</strong>'
+        f'<span>{html.escape(item.created_at)}</span><div class="history-actions">'
         f'<a href="/blueprints/{html.escape(item.id)}">Reopen blueprint</a>'
-        f'<a href="/blueprints/{html.escape(item.id)}.md">Export Markdown</a></li>'
+        f'<a href="/blueprints/{html.escape(item.id)}.md">Export Markdown</a></div></div></li>'
         for item in state.items
     )
-    return f'<section class="panel history"><p class="eyebrow">Project History</p><h2>{html.escape(state.heading)}</h2><ul>{items}</ul></section>'
+    return f'<aside class="history-sidebar glass-panel" aria-label="Project history"><p class="eyebrow">Project History</p><h2>{html.escape(state.heading)}</h2><p>{html.escape(state.description)}</p><ul>{items}</ul></aside>'
 
 
 def _latest_result_html(result: BlueprintResult | None) -> str:
     if result is None:
         return ""
     if result.status == "error":
-        return f'<section class="panel alert"><h2>Generation paused</h2><p>{html.escape(result.error_message)}</p></section>'
+        return f'<section class="glass-panel alert"><h2>Generation paused</h2><p>{html.escape(result.error_message)}</p></section>'
     if result.status == "research_warning":
         findings = _research_list_html(result.research_findings)
         return (
-            '<section class="panel warning"><h2>Research needs attention</h2>'
+            '<section class="glass-panel warning"><h2>Research needs attention</h2>'
             f"<p>{html.escape(result.warning_message)}</p>{findings}"
             '<div class="actions">'
             f'<form method="post" action="/research/retry"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Retry research</button></form>'
@@ -506,10 +507,10 @@ def _latest_result_html(result: BlueprintResult | None) -> str:
         )
     findings = _research_list_html(result.research_findings)
     return (
-        '<section class="panel result"><p class="eyebrow">Completed Blueprint</p>'
+        '<section class="glass-panel result"><div class="blueprint-deliverable"><p class="eyebrow">Completed Blueprint</p>'
         f"<h2>{html.escape(result.idea)}</h2>{findings}"
         f'<a class="primary" href="/blueprints/{html.escape(result.id)}.md">Export Markdown</a>'
-        f"<pre>{html.escape(result.blueprint_markdown)}</pre></section>"
+        f"<pre aria-label=\"Generated blueprint Markdown\">{html.escape(result.blueprint_markdown)}</pre></div></section>"
     )
 
 
@@ -517,9 +518,12 @@ def _research_list_html(findings: list[ResearchFinding]) -> str:
     if not findings:
         return '<p class="muted">No useful cited findings were collected yet.</p>'
     items = "".join(
-        "<li>"
-        f"<strong>{html.escape(finding.category.title())}</strong>: {html.escape(finding.summary)}"
-        f'<br><a href="{html.escape(finding.source_url)}">{html.escape(finding.source_title)}</a>'
+        '<li class="evidence-card">'
+        f'<div><p class="eyebrow">Source type: {html.escape(finding.category.title())}</p>'
+        f"<strong>{html.escape(finding.source_title)}</strong>"
+        f'<span class="credibility">Credibility cue: cited web source reviewed by admin</span></div>'
+        f"<p>{html.escape(finding.summary)}</p>"
+        f'<a href="{html.escape(finding.source_url)}">Open source</a>'
         f'<span>{html.escape(finding.source_detail)}</span></li>'
         for finding in findings
     )
@@ -534,43 +538,79 @@ def _page_template(*, history_html: str, latest_html: str) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Zelvari App Factory</title>
   <style>
-    :root {{ color-scheme: dark; --bg:#08111f; --panel:#101c30; --line:#243755; --text:#eef6ff; --muted:#a9b9cc; --cyan:#31d7ff; --blue:#3b82f6; }}
+    :root {{ color-scheme: dark; --bg:#030712; --panel:rgba(10,22,42,.76); --panel-strong:rgba(16,30,56,.92); --line:rgba(129,199,255,.24); --text:#f3f8ff; --muted:#adc0d8; --cyan:#2ee8ff; --violet:#9d6bff; --blue:#4b8dff; --gold:#ffd166; }}
     * {{ box-sizing: border-box; }}
-    body {{ margin:0; font-family: Inter, ui-sans-serif, system-ui, Segoe UI, sans-serif; background: radial-gradient(circle at top left, #12345e, var(--bg) 42%); color:var(--text); }}
-    main {{ max-width:1120px; margin:0 auto; padding:48px 20px; }}
-    .hero {{ display:grid; gap:24px; grid-template-columns: minmax(0, 1.4fr) minmax(280px, .8fr); align-items:stretch; }}
-    .panel {{ border:1px solid var(--line); background:rgba(16,28,48,.9); border-radius:24px; padding:28px; box-shadow:0 24px 80px rgba(0,0,0,.28); }}
+    html {{ scroll-behavior:smooth; }}
+    body {{ margin:0; min-height:100vh; font-family: Inter, ui-sans-serif, system-ui, Segoe UI, sans-serif; background:radial-gradient(circle at 18% 10%, rgba(46,232,255,.2), transparent 28%), radial-gradient(circle at 84% 2%, rgba(157,107,255,.24), transparent 32%), linear-gradient(135deg,#020617 0%,#081426 52%,#020617 100%); color:var(--text); }}
+    body::before {{ content:""; position:fixed; inset:0; pointer-events:none; background:linear-gradient(120deg, transparent, rgba(46,232,255,.08), transparent); animation:aurora 10s ease-in-out infinite alternate; }}
+    main {{ width:min(1480px, 100%); margin:0 auto; padding:28px; position:relative; }}
+    .app-shell.command-center {{ display:grid; grid-template-columns:310px minmax(0,1fr); gap:24px; align-items:start; }}
+    .command-main {{ display:grid; gap:22px; }}
+    .workspace-hero {{ display:grid; grid-template-columns:minmax(0,1.05fr) minmax(340px,.95fr); gap:22px; align-items:stretch; }}
+    .glass-panel {{ border:1px solid var(--line); background:linear-gradient(145deg, rgba(9,20,39,.86), rgba(15,29,55,.68)); border-radius:28px; padding:28px; box-shadow:0 28px 90px rgba(0,0,0,.36), inset 0 1px 0 rgba(255,255,255,.08); backdrop-filter:blur(18px); transition:transform .22s ease, border-color .22s ease, box-shadow .22s ease; }}
+    .glass-panel:hover {{ transform:translateY(-2px); border-color:rgba(46,232,255,.48); box-shadow:0 32px 105px rgba(0,0,0,.44), 0 0 38px rgba(46,232,255,.1); }}
+    .panel {{ border:1px solid var(--line); background:var(--panel); border-radius:24px; padding:24px; }}
     .eyebrow {{ color:var(--cyan); text-transform:uppercase; letter-spacing:.16em; font-size:.76rem; font-weight:800; }}
-    h1 {{ font-size:clamp(2.4rem, 6vw, 5.4rem); line-height:.9; margin:8px 0 16px; }}
-    h2 {{ margin-top:0; }}
-    p {{ color:var(--muted); line-height:1.65; }}
+    h1 {{ font-size:clamp(2.55rem, 6vw, 5.8rem); line-height:.88; margin:8px 0 16px; letter-spacing:-.07em; }}
+    h2 {{ margin-top:0; letter-spacing:-.03em; }}
+    h3 {{ letter-spacing:-.02em; }}
+    p {{ color:var(--muted); line-height:1.7; font-size:1rem; }}
     label {{ display:block; margin:18px 0 8px; font-weight:800; }}
-    textarea {{ width:100%; min-height:150px; border-radius:18px; border:1px solid var(--line); background:#07111f; color:var(--text); padding:18px; font:inherit; }}
-    button, .primary {{ display:inline-flex; align-items:center; justify-content:center; border:0; border-radius:999px; padding:13px 18px; margin-top:14px; color:#04111f; background:linear-gradient(135deg,var(--cyan),var(--blue)); font-weight:900; text-decoration:none; cursor:pointer; }}
-    .secondary {{ background:#e8f7ff; }}
-    .scope {{ margin-top:18px; padding:14px 16px; border-radius:18px; background:#07111f; border:1px solid var(--line); color:#d9e9ff; }}
-    .grid {{ display:grid; grid-template-columns: .9fr 1.1fr; gap:22px; margin-top:22px; }}
-    ul {{ padding-left:20px; }}
+    textarea {{ width:100%; min-height:190px; border-radius:22px; border:1px solid var(--line); background:rgba(3,9,20,.82); color:var(--text); padding:18px; font:inherit; box-shadow:inset 0 0 28px rgba(46,232,255,.05); }}
+    button, .primary {{ display:inline-flex; align-items:center; justify-content:center; border:0; border-radius:999px; padding:13px 19px; margin-top:14px; color:#03101d; background:linear-gradient(135deg,var(--cyan),var(--blue) 58%,var(--violet)); font-weight:900; text-decoration:none; cursor:pointer; box-shadow:0 14px 34px rgba(46,232,255,.2); transition:transform .2s ease, box-shadow .2s ease; }}
+    button:hover, .primary:hover {{ transform:translateY(-1px); box-shadow:0 18px 42px rgba(46,232,255,.3); }}
+    :focus-visible {{ outline:3px solid var(--gold); outline-offset:4px; }}
+    .secondary {{ background:linear-gradient(135deg,#effaff,#b9e8ff); }}
+    .scope {{ margin-top:18px; padding:16px 18px; border-radius:20px; background:rgba(3,9,20,.68); border:1px solid var(--line); color:#e5f4ff; }}
+    .research-pipeline {{ display:grid; grid-template-columns:repeat(5, minmax(110px,1fr)); gap:12px; margin-top:22px; }}
+    .pipeline-stage {{ position:relative; min-height:94px; border:1px solid rgba(46,232,255,.22); border-radius:18px; padding:14px; background:rgba(8,18,34,.72); color:#dfeeff; }}
+    .pipeline-stage::before {{ content:""; display:block; width:10px; height:10px; border-radius:999px; margin-bottom:10px; background:var(--cyan); box-shadow:0 0 18px var(--cyan); animation:pulse 1.9s ease-in-out infinite; }}
+    .pipeline-stage span {{ display:block; color:var(--muted); font-size:.84rem; margin-top:4px; }}
+    .support-grid {{ display:grid; grid-template-columns:minmax(0,1fr) minmax(300px,.65fr); gap:22px; }}
+    ul {{ padding-left:0; list-style:none; }}
     li {{ margin:0 0 12px; color:var(--muted); }}
-    .findings a {{ color:#9be9ff; }}
-    .findings span {{ display:block; color:#88a0bb; margin-top:4px; }}
+    .history-sidebar {{ position:sticky; top:24px; min-height:calc(100vh - 56px); }}
+    .history-item {{ display:flex; gap:12px; padding:14px; border:1px solid rgba(255,255,255,.08); border-radius:18px; background:rgba(255,255,255,.035); }}
+    .history-item strong, .evidence-card strong {{ display:block; color:var(--text); }}
+    .history-item span, .history-actions {{ display:block; color:#91a8c4; font-size:.88rem; margin-top:4px; }}
+    .history-actions {{ display:flex; gap:12px; flex-wrap:wrap; }}
+    .history-actions a, .findings a {{ color:#9be9ff; }}
+    .status-dot {{ width:10px; height:10px; flex:0 0 10px; margin-top:5px; border-radius:999px; background:var(--cyan); box-shadow:0 0 16px rgba(46,232,255,.8); }}
+    .findings {{ display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:14px; }}
+    .evidence-card {{ padding:18px; border:1px solid rgba(129,199,255,.22); border-radius:20px; background:linear-gradient(160deg, rgba(5,14,29,.92), rgba(20,31,58,.72)); }}
+    .evidence-card .eyebrow {{ margin:0 0 6px; }}
+    .evidence-card .credibility, .findings span {{ display:block; color:#9fb3cc; margin-top:6px; font-size:.9rem; }}
     .warning {{ border-color:#fbbf24; }} .alert {{ border-color:#fb7185; }}
     .actions {{ display:flex; gap:12px; flex-wrap:wrap; }}
-    pre {{ white-space:pre-wrap; background:#050b14; border:1px solid var(--line); border-radius:18px; padding:18px; overflow:auto; }}
+    .blueprint-deliverable pre {{ white-space:pre-wrap; background:linear-gradient(180deg, rgba(2,8,18,.96), rgba(5,14,28,.92)); border:1px solid rgba(46,232,255,.2); border-radius:22px; padding:22px; overflow:auto; line-height:1.68; box-shadow:inset 0 0 26px rgba(46,232,255,.04); }}
     .muted {{ color:#8da1b8; }}
-    @media (max-width: 820px) {{ .hero, .grid {{ grid-template-columns:1fr; }} }}
+    @keyframes aurora {{ from {{ opacity:.55; transform:translateX(-4%); }} to {{ opacity:.95; transform:translateX(4%); }} }}
+    @keyframes pulse {{ 0%,100% {{ transform:scale(.9); opacity:.75; }} 50% {{ transform:scale(1.12); opacity:1; }} }}
+    @media (prefers-reduced-motion: reduce) {{ *, *::before, *::after {{ animation:none !important; transition:none !important; scroll-behavior:auto !important; }} }}
+    @media (max-width: 1040px) {{ .app-shell.command-center, .workspace-hero, .support-grid {{ grid-template-columns:1fr; }} .history-sidebar {{ position:static; min-height:auto; order:3; }} .research-pipeline {{ grid-template-columns:1fr; }} }}
+    @media (max-width: 720px) {{ main {{ padding:16px; }} .glass-panel {{ padding:20px; border-radius:22px; }} .findings {{ grid-template-columns:1fr; }} h1 {{ font-size:clamp(2.25rem, 14vw, 3.8rem); }} }}
   </style>
 </head>
 <body>
 <main>
-  <section class="hero">
-    <div class="panel">
+  <div class="app-shell command-center">
+    {history_html}
+    <div class="command-main">
+      <section class="workspace-hero glass-panel">
+        <div>
       <p class="eyebrow">Local/Admin Blueprint Studio</p>
       <h1>Zelvari App Factory</h1>
       <p>Create monetization-ready app blueprints from a raw idea using automatic web research and the configured local LLM by default.</p>
       <p class="scope"><strong>Version 1 scope:</strong> this creates a monetization-ready blueprint, not a finished generated app. Markdown export only.</p>
+      <div class="research-pipeline" aria-label="Research pipeline progress">
+        <div class="pipeline-stage"><strong>Idea intake</strong><span>Capture the raw app opportunity.</span></div>
+        <div class="pipeline-stage"><strong>Market scan</strong><span>Find pain and urgency signals.</span></div>
+        <div class="pipeline-stage"><strong>Source review</strong><span>Surface cited evidence cards.</span></div>
+        <div class="pipeline-stage"><strong>Blueprint generation</strong><span>Use the configured local AI model.</span></div>
+        <div class="pipeline-stage"><strong>Export readiness</strong><span>Save locally and export Markdown only.</span></div>
+      </div>
     </div>
-    <form id="idea" class="panel" method="post" action="/blueprints">
+    <form id="idea" class="panel idea-console" method="post" action="/blueprints">
       <p class="eyebrow">Primary Idea Flow</p>
       <label for="idea-input">App idea</label>
       <textarea id="idea-input" name="idea" placeholder="Example: AI appointment recovery assistant for small clinics"></textarea>
@@ -578,10 +618,12 @@ def _page_template(*, history_html: str, latest_html: str) -> str:
       <p>Web research runs automatically for each submission. No public accounts, hosting setup, payments, or customer login are required.</p>
     </form>
   </section>
-  <section class="grid">
-    {history_html}
-    <div>{latest_html or '<section class="panel"><h2>Blueprint structure</h2><p>Each completed blueprint includes pain points, urgency, audience, features, monetization, tech plan, launch checklist, and risks.</p></section>'}</div>
+  <section class="support-grid">
+    <div>{latest_html or '<section class="glass-panel"><h2>Blueprint structure</h2><p>Each completed blueprint includes pain points, urgency, audience, features, monetization, tech plan, launch checklist, and risks.</p></section>'}</div>
+    <aside class="glass-panel" aria-label="Command center guidance"><p class="eyebrow">Operator Guidance</p><h2>Blueprint-only first version</h2><p>The workspace researches the market, cites sources, saves local history, and prepares a professional Markdown deliverable while avoiding account flows, billing setup, hosting deployment, PDF output, and completed app-code generation.</p></aside>
   </section>
+    </div>
+  </div>
 </main>
 </body>
 </html>"""

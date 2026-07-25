@@ -214,6 +214,26 @@ class AppFactoryTests(unittest.TestCase):
         for phrase in forbidden:
             self.assertNotIn(phrase, html)
 
+    def test_ui_html_presents_premium_command_center_layout_with_accessible_motion_and_evidence_cards(self):
+        app = create_app(self.storage_path, researcher=StubResearcher(self.good_findings), llm=StubLLM(self.good_blueprint))
+        app.latest_result = app.factory.submit_idea("AI estimate follow-up assistant")
+
+        html = app.render_home()
+
+        self.assertIn('class="app-shell command-center"', html)
+        self.assertIn('class="history-sidebar glass-panel"', html)
+        self.assertIn('class="workspace-hero glass-panel"', html)
+        self.assertIn('class="research-pipeline" aria-label="Research pipeline progress"', html)
+        for stage in ["Idea intake", "Market scan", "Source review", "Blueprint generation", "Export readiness"]:
+            self.assertIn(stage, html)
+        self.assertIn('class="evidence-card"', html)
+        self.assertIn("Credibility cue", html)
+        self.assertIn("Source type", html)
+        self.assertIn('class="blueprint-deliverable"', html)
+        self.assertIn("@media (prefers-reduced-motion: reduce)", html)
+        self.assertIn(":focus-visible", html)
+        self.assertIn("grid-template-columns:1fr", html)
+
 def call_wsgi(app, method, path):
     captured = {}
 
