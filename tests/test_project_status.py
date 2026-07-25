@@ -8,7 +8,7 @@ class ProjectStatusTests(unittest.TestCase):
         identity = project_identity()
         self.assertEqual(identity["company"], "Zelvari")
         self.assertEqual(identity["repo"], "ivanhermes777/loops")
-        self.assertEqual(identity["operator"], "Hermes + OpenAI Codex OAuth")
+        self.assertEqual(identity["operator"], "Hermes-native Finn loop repair lane")
 
     def test_loop_status_documents_rocket_merge_gate(self):
         status = loop_status()

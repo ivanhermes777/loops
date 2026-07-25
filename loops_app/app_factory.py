@@ -15,6 +15,7 @@ import secrets
 import shutil
 import subprocess
 import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -34,14 +35,69 @@ REQUIRED_BLUEPRINT_SECTIONS = (
     "Risks",
 )
 
-HERMES_UNAVAILABLE_MESSAGE = (
-    "Hermes with OpenAI Codex OAuth is unavailable. Confirm that Hermes is "
-    "installed, OpenAI Codex is logged in, and Hermes live search is enabled."
+RESEARCH_CATEGORIES = (
+    "pain points",
+    "urgency angles",
+    "audience signals",
+    "monetization opportunities",
+)
+
+LOCAL_AI_UNAVAILABLE_MESSAGE = (
+    "The local AI backend is unavailable. Confirm that the configured local model/service "
+    "is running, reachable, and matches your ZELVARI_LOCAL_LLM_* settings."
 )
 
 
 class HermesUnavailableError(RuntimeError):
     """Raised when Hermes cannot research or generate through Codex OAuth."""
+
+
+class LocalAIUnavailableError(RuntimeError):
+    """Raised when the configured local LLM backend is stopped or misconfigured."""
+
+
+class DuckDuckGoResearcher:
+    """Default no-login web researcher using DuckDuckGo HTML results."""
+
+    def __init__(self, endpoint: str | None = None, timeout_seconds: float | None = None):
+        self.endpoint = endpoint or os.getenv("ZELVARI_RESEARCH_ENDPOINT", "https://html.duckduckgo.com/html/")
+        self.timeout_seconds = timeout_seconds or float(os.getenv("ZELVARI_RESEARCH_TIMEOUT", "20"))
+
+    def research(self, idea: str) -> list[ResearchFinding]:
+        findings: list[ResearchFinding] = []
+        for category in RESEARCH_CATEGORIES:
+            try:
+                findings.append(self._search_category(idea, category))
+            except Exception as exc:
+                exc.partial_findings = findings  # type: ignore[attr-defined]
+                raise
+        return findings
+
+    def _search_category(self, idea: str, category: str) -> ResearchFinding:
+        query = f"{idea} app {category} market research"
+        payload = urllib.parse.urlencode({"q": query}).encode("utf-8")
+        request = urllib.request.Request(
+            self.endpoint,
+            data=payload,
+            headers={"User-Agent": "ZelvariAppFactory/1.0", "Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            page = response.read().decode("utf-8", errors="replace")
+        links = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', page, flags=re.DOTALL)
+        snippets = re.findall(r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>|<div[^>]+class="result__snippet"[^>]*>(.*?)</div>', page, flags=re.DOTALL)
+        if not links:
+            raise RuntimeError(f"No useful web results for {category}")
+        raw_url, raw_title = links[0]
+        snippet_parts = snippets[0] if snippets else ("", "")
+        summary = _clean_html_text(next((part for part in snippet_parts if part), "Relevant market source found for this category."))
+        return ResearchFinding(
+            category=category,
+            summary=summary,
+            source_title=_clean_html_text(raw_title),
+            source_url=_extract_duckduckgo_url(html.unescape(raw_url)),
+            source_detail=f"DuckDuckGo result for query: {query}",
+        )
 
 
 @dataclass(frozen=True)
@@ -191,6 +247,49 @@ class HermesCodexAgent:
         return text
 
 
+class LocalOllamaLLM:
+    """Configured local Ollama-compatible LLM backend for blueprint generation."""
+
+    def __init__(
+        self,
+        endpoint: str | None = None,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+    ):
+        self.endpoint = endpoint or os.getenv("ZELVARI_LOCAL_LLM_ENDPOINT", "http://127.0.0.1:11434/api/generate")
+        self.model = model or os.getenv("ZELVARI_LOCAL_LLM_MODEL", "llama3.1")
+        self.timeout_seconds = timeout_seconds or float(os.getenv("ZELVARI_LOCAL_LLM_TIMEOUT", "180"))
+
+    def generate_blueprint(
+        self,
+        idea: str,
+        findings: list[ResearchFinding],
+        *,
+        allow_ai_only: bool = False,
+    ) -> str:
+        prompt = _blueprint_prompt(idea, findings, allow_ai_only=allow_ai_only)
+        payload = json.dumps({"model": self.model, "prompt": prompt, "stream": False}).encode("utf-8")
+        request = urllib.request.Request(
+            self.endpoint,
+            data=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                body = response.read().decode("utf-8")
+        except Exception as exc:
+            raise LocalAIUnavailableError(str(exc)) from exc
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise LocalAIUnavailableError("Local AI backend returned invalid JSON") from exc
+        text = str(data.get("response") or data.get("content") or data.get("message", {}).get("content", "")).strip()
+        if not text:
+            raise LocalAIUnavailableError("Local AI backend returned an empty blueprint")
+        return _ensure_blueprint_structure(text, idea, findings, allow_ai_only=allow_ai_only)
+
+
 class AppFactory:
     """Core application service used by tests and the local HTTP UI."""
 
@@ -202,9 +301,8 @@ class AppFactory:
         llm: LocalLLM | None = None,
     ):
         self.storage_path = Path(storage_path)
-        default_agent = HermesCodexAgent()
-        self.researcher = researcher or default_agent
-        self.llm = llm or default_agent
+        self.researcher = researcher or DuckDuckGoResearcher()
+        self.llm = llm or LocalOllamaLLM()
         self._pending: dict[str, BlueprintResult] = {}
 
     def submit_idea(self, idea: str) -> BlueprintResult:
@@ -295,8 +393,8 @@ class AppFactory:
         findings = _sanitize_findings(findings)
         try:
             blueprint = self.llm.generate_blueprint(idea, findings, allow_ai_only=allow_ai_only)
-        except HermesUnavailableError:
-            return BlueprintResult(status="error", idea=idea, research_findings=findings, error_message=HERMES_UNAVAILABLE_MESSAGE)
+        except (LocalAIUnavailableError, HermesUnavailableError):
+            return BlueprintResult(status="error", idea=idea, research_findings=findings, error_message=LOCAL_AI_UNAVAILABLE_MESSAGE)
         blueprint = _ensure_blueprint_structure(blueprint, idea, findings, allow_ai_only=allow_ai_only)
         result = BlueprintResult(
             id=uuid.uuid4().hex,
@@ -419,7 +517,7 @@ def _blueprint_prompt(idea: str, findings: list[ResearchFinding], *, allow_ai_on
         research_block = (research_block or "No strong cited sources available.") + "\nLabel any unsupported suggestions as AI-only."
     sections = ", ".join(REQUIRED_BLUEPRINT_SECTIONS)
     return (
-        "You are Zelvari App Factory running through Hermes with OpenAI Codex OAuth. "
+        "You are Zelvari App Factory running through the configured local LLM backend. "
         "Generate a professional monetization-ready app blueprint, not finished app code.\n"
         f"Idea: {idea}\n"
         f"Cited research findings:\n{research_block}\n"
@@ -542,7 +640,7 @@ def _latest_result_html(result: BlueprintResult | None, admin_token: str) -> str
             f"<p>{html.escape(result.warning_message)}</p>{findings}"
             '<div class="actions">'
             f'<form method="post" action="/research/retry"><input type="hidden" name="admin_token" value="{html.escape(admin_token)}"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Retry research</button></form>'
-            f'<form method="post" action="/research/continue-ai-only"><input type="hidden" name="admin_token" value="{html.escape(admin_token)}"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Continue with Hermes AI-only suggestions</button></form>'
+            f'<form method="post" action="/research/continue-ai-only"><input type="hidden" name="admin_token" value="{html.escape(admin_token)}"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Continue with local AI-only suggestions</button></form>'
             "</div></section>"
         )
     findings = _research_list_html(result.research_findings)
@@ -611,8 +709,8 @@ def _page_template(*, history_html: str, latest_html: str, admin_token: str) -> 
     :focus-visible {{ outline:3px solid var(--gold); outline-offset:4px; }}
     .secondary {{ background:linear-gradient(135deg,#effaff,#b9e8ff); }}
     .scope {{ margin-top:18px; padding:16px 18px; border-radius:20px; background:rgba(3,9,20,.68); border:1px solid var(--line); color:#e5f4ff; }}
-    .research-pipeline {{ display:grid; grid-template-columns:repeat(5, minmax(110px,1fr)); gap:12px; margin-top:22px; }}
-    .pipeline-stage {{ position:relative; min-height:94px; border:1px solid rgba(46,232,255,.22); border-radius:18px; padding:14px; background:rgba(8,18,34,.72); color:#dfeeff; }}
+    .research-pipeline {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(min(100%, 72px), 1fr)); gap:12px; margin-top:22px; }}
+    .pipeline-stage {{ position:relative; min-width:0; min-height:94px; border:1px solid rgba(46,232,255,.22); border-radius:18px; padding:14px; background:rgba(8,18,34,.72); color:#dfeeff; overflow-wrap:anywhere; }}
     .pipeline-stage::before {{ content:""; display:block; width:10px; height:10px; border-radius:999px; margin-bottom:10px; background:var(--cyan); box-shadow:0 0 18px var(--cyan); animation:pulse 1.9s ease-in-out infinite; }}
     .pipeline-stage span {{ display:block; color:var(--muted); font-size:.84rem; margin-top:4px; }}
     .support-grid {{ display:grid; grid-template-columns:minmax(0,1fr) minmax(300px,.65fr); gap:22px; }}
@@ -649,14 +747,14 @@ def _page_template(*, history_html: str, latest_html: str, admin_token: str) -> 
         <div>
       <p class="eyebrow">Local/Admin Blueprint Studio</p>
       <h1>Zelvari App Factory</h1>
-      <p>Create monetization-ready app blueprints from a raw idea using Hermes live search and your authenticated OpenAI Codex session.</p>
-      <p class="scope"><strong>Agent online:</strong> Hermes · OpenAI Codex OAuth · live web search</p>
+      <p>Create monetization-ready app blueprints from a raw idea using automatic web research and your configured local LLM backend.</p>
+      <p class="scope"><strong>Agent online:</strong> local/admin-only web research · configured local LLM generation</p>
       <p class="scope"><strong>Version 1 scope:</strong> this creates a monetization-ready blueprint, not a finished generated app. Markdown export only.</p>
       <div class="research-pipeline" aria-label="Research pipeline progress">
         <div class="pipeline-stage"><strong>Idea intake</strong><span>Capture the raw app opportunity.</span></div>
         <div class="pipeline-stage"><strong>Market scan</strong><span>Find pain and urgency signals.</span></div>
         <div class="pipeline-stage"><strong>Source review</strong><span>Surface cited evidence cards.</span></div>
-        <div class="pipeline-stage"><strong>Blueprint generation</strong><span>Use Hermes with OpenAI Codex OAuth.</span></div>
+        <div class="pipeline-stage"><strong>Blueprint generation</strong><span>Use the configured local LLM.</span></div>
         <div class="pipeline-stage"><strong>Export readiness</strong><span>Save locally and export Markdown only.</span></div>
       </div>
     </div>
@@ -667,7 +765,7 @@ def _page_template(*, history_html: str, latest_html: str, admin_token: str) -> 
       <textarea id="idea-input" name="idea" placeholder="Example: AI appointment recovery assistant for small clinics"></textarea>
       <button type="submit" data-idle-label="Research and create blueprint">Research and create blueprint</button>
       <p class="working-status" role="status" aria-live="polite"></p>
-      <p>Hermes live search runs automatically for each submission. No API key or Ollama service is required.</p>
+      <p>Web research runs automatically for each submission, then the configured local AI service generates the blueprint.</p>
     </form>
   </section>
   <section class="support-grid">
@@ -685,8 +783,8 @@ def _page_template(*, history_html: str, latest_html: str, admin_token: str) -> 
       button.disabled = true;
       button.setAttribute("aria-busy", "true");
       button.textContent = form.action.includes("/blueprints")
-        ? "Hermes is researching live sources…"
-        : "Hermes is working…";
+        ? "Researching live sources…"
+        : "Local AI is working…";
       const status = form.querySelector(".working-status");
       if (status) status.textContent = "Searching live sources, reviewing evidence, and generating your blueprint. This can take a minute.";
     }});
@@ -721,6 +819,17 @@ def _safe_source_url(url: str) -> str:
     if parsed.scheme in {"http", "https"} and parsed.netloc:
         return urllib.parse.urlunparse(parsed)
     return ""
+
+
+def _extract_duckduckgo_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    query_url = urllib.parse.parse_qs(parsed.query).get("uddg", [""])[0]
+    return _safe_source_url(query_url or url)
+
+
+def _clean_html_text(value: str) -> str:
+    without_tags = re.sub(r"<[^>]+>", " ", value)
+    return re.sub(r"\s+", " ", html.unescape(without_tags)).strip()
 
 
 def _is_local_host(host: str) -> bool:

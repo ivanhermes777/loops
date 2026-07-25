@@ -6,7 +6,7 @@ This repo is connected to:
 
 - Linear team: `ZEL`
 - GitHub repo: `ivanhermes777/loops`
-- Operator: Hermes with OpenAI Codex OAuth
+- Operator: Hermes-native Finn loop repair lane
 - Final merge gate: Michael approves by reacting with 🚀 on a merge-ready PR comment
 
 ## Loop Workflow
@@ -36,8 +36,8 @@ Version 1 scope:
 
 - Creates monetization-ready app blueprints from a submitted idea.
 - Runs web research automatically for pain points, urgency angles, audience signals, and monetization opportunities.
-- Uses Hermes with the operator's authenticated OpenAI Codex OAuth session.
-- Uses Hermes' built-in live web search for cited market evidence.
+- Uses no-login web research for cited market evidence.
+- Uses the configured local LLM backend by default for blueprint generation.
 - Saves completed blueprints locally so they can be reopened from project history.
 - Exports completed blueprints as Markdown only.
 - Does **not** provide public signup/login, customer accounts, payment setup, deployment, PDF export, or generated app code.
@@ -60,35 +60,38 @@ If your local shell only exposes Python as `python3`, use:
 python3 -m loops_app.app_factory
 ```
 
-### Hermes + OpenAI Codex OAuth configuration
+### Local LLM configuration
 
-The app does not require Ollama or a separate model API key. It calls the local
-Hermes CLI, which must be authenticated to OpenAI Codex:
-
-```bash
-hermes doctor
-```
-
-`OpenAI Codex auth` and the `web` tool should both show as available. For the
-free built-in DuckDuckGo search provider:
+The app uses an Ollama-compatible local generation endpoint by default. Start
+your local model service before submitting an idea:
 
 ```bash
-hermes tools post-setup ddgs
-hermes config set web.search_backend ddgs
+ollama serve
+ollama pull llama3.1
 ```
 
-Optional overrides:
+Default local AI settings:
 
 ```text
-ZELVARI_HERMES_COMMAND=/home/hermes/.local/bin/hermes
-ZELVARI_HERMES_TIMEOUT=360
+ZELVARI_LOCAL_LLM_ENDPOINT=http://127.0.0.1:11434/api/generate
+ZELVARI_LOCAL_LLM_MODEL=llama3.1
+ZELVARI_LOCAL_LLM_TIMEOUT=180
 ```
 
-If Hermes, Codex OAuth, or live search is unavailable, the app pauses with a
-clear operator-facing error instead of silently inventing research.
+Optional web-research overrides:
 
-Run a real authenticated smoke test (this performs live search and one Codex
-generation):
+```text
+ZELVARI_RESEARCH_ENDPOINT=https://html.duckduckgo.com/html/
+ZELVARI_RESEARCH_TIMEOUT=20
+```
+
+If the configured local model/service is unavailable, the app pauses with a
+clear local-AI-backend error instead of crashing or requiring a cloud AI provider.
+If web research fails or returns weak results, the app shows a warning, preserves
+partial findings when available, and lets the admin retry or continue with
+clearly labeled AI-only suggestions.
+
+Run a local generation smoke test:
 
 ```bash
 python3 bin/verify_hermes_runtime.py

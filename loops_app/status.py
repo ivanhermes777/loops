@@ -6,7 +6,7 @@ def project_identity() -> dict[str, str]:
     return {
         "company": "Zelvari",
         "repo": "ivanhermes777/loops",
-        "operator": "Hermes + OpenAI Codex OAuth",
+        "operator": "Hermes-native Finn loop repair lane",
     }
 
 

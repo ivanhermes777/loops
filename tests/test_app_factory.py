@@ -10,8 +10,11 @@ from unittest.mock import patch
 from loops_app.app_factory import (
     AppFactory,
     BlueprintResult,
+    DuckDuckGoResearcher,
     HermesCodexAgent,
     HermesUnavailableError,
+    LocalAIUnavailableError,
+    LocalOllamaLLM,
     ResearchFinding,
     _parse_hermes_findings,
     create_app,
@@ -78,7 +81,7 @@ class AppFactoryTests(unittest.TestCase):
                 "## Monetization",
                 "Monthly admin-only SaaS subscription.",
                 "## Tech Plan",
-                "Local-first Python MVP with Hermes and OpenAI Codex OAuth.",
+                "Local-first Python MVP with configured local LLM generation.",
                 "## Launch Checklist",
                 "Interview clinics and validate pricing.",
                 "## Risks",
@@ -116,19 +119,52 @@ class AppFactoryTests(unittest.TestCase):
         self.assertEqual(reopened.blueprint_markdown, result.blueprint_markdown)
         self.assertEqual(factory.history()[0].title, "AI appointment recovery for clinics")
 
-    def test_hermes_unavailable_fails_gracefully_with_clear_admin_error(self):
+    def test_local_llm_unavailable_fails_gracefully_with_clear_admin_error(self):
         factory = AppFactory(
             self.storage_path,
             researcher=StubResearcher(self.good_findings),
-            llm=StubLLM(error=HermesUnavailableError("connection refused")),
+            llm=StubLLM(error=LocalAIUnavailableError("connection refused")),
         )
 
         result = factory.submit_idea("AI quoting tool")
 
         self.assertEqual(result.status, "error")
-        self.assertIn("Hermes with OpenAI Codex OAuth is unavailable", result.error_message)
-        self.assertIn("live search is enabled", result.error_message)
+        self.assertIn("local AI backend is unavailable", result.error_message)
+        self.assertIn("configured local model/service", result.error_message)
         self.assertEqual(factory.history(), [])
+
+    def test_default_app_factory_uses_configured_local_llm_for_blueprint_generation(self):
+        blueprint = self.good_blueprint
+
+        class FakeHTTPResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps({"response": blueprint}).encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=FakeHTTPResponse()) as urlopen:
+            factory = AppFactory(self.storage_path, researcher=StubResearcher(self.good_findings))
+            result = factory.submit_idea("AI local-first estimator")
+
+        self.assertEqual(result.status, "complete")
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(request.full_url, "http://127.0.0.1:11434/api/generate")
+        self.assertEqual(payload["model"], "llama3.1")
+        self.assertFalse(payload["stream"])
+        self.assertIn("configured local LLM", payload["prompt"])
+        self.assertIn("## Monetization", result.blueprint_markdown)
+
+    def test_local_ollama_llm_reports_misconfigured_or_stopped_backend_as_local_ai_unavailable(self):
+        llm = LocalOllamaLLM(endpoint="http://127.0.0.1:9/api/generate", model="llama3.1", timeout_seconds=0.01)
+
+        with patch("urllib.request.urlopen", side_effect=URLError("connection refused")):
+            with self.assertRaises(LocalAIUnavailableError):
+                llm.generate_blueprint("AI quoting tool", self.good_findings)
 
     def test_research_failure_preserves_partial_findings_and_offers_retry_or_ai_only_continue(self):
         partial_error = URLError("timeout")
@@ -152,6 +188,28 @@ class AppFactoryTests(unittest.TestCase):
         self.assertEqual(continued.status, "complete")
         self.assertTrue(continued.used_ai_only_suggestions)
         self.assertTrue(factory.history())
+
+    def test_default_duckduckgo_researcher_preserves_collected_findings_when_later_category_times_out(self):
+        good_findings = self.good_findings
+
+        class PartialDuckDuckGoResearcher(DuckDuckGoResearcher):
+            def __init__(self):
+                pass
+
+            def _search_category(self, idea, category):
+                if category == "pain points":
+                    return good_findings[0]
+                raise TimeoutError("later category timed out")
+
+        researcher = PartialDuckDuckGoResearcher()
+        factory = AppFactory(self.storage_path, researcher=researcher, llm=StubLLM(self.good_blueprint))
+
+        result = factory.submit_idea("AI partial research helper")
+
+        self.assertEqual(result.status, "research_warning")
+        self.assertEqual(result.research_findings, self.good_findings[:1])
+        self.assertTrue(result.can_retry_research)
+        self.assertTrue(result.can_continue_with_ai_only)
 
     def test_hermes_live_search_parser_accepts_real_citations_and_rejects_placeholders(self):
         raw = """```json
@@ -384,6 +442,9 @@ class AppFactoryTests(unittest.TestCase):
         self.assertIn('class="history-sidebar glass-panel"', html)
         self.assertIn('class="workspace-hero glass-panel"', html)
         self.assertIn('class="research-pipeline" aria-label="Research pipeline progress"', html)
+        self.assertIn("grid-template-columns:repeat(auto-fit, minmax(min(100%, 72px), 1fr))", html)
+        self.assertIn("min-width:0", html)
+        self.assertIn("overflow-wrap:anywhere", html)
         for stage in ["Idea intake", "Market scan", "Source review", "Blueprint generation", "Export readiness"]:
             self.assertIn(stage, html)
         self.assertIn('class="evidence-card"', html)
