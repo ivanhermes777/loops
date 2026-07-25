@@ -238,9 +238,11 @@ class BuybackApp:
             return HTTPStatus.OK, self._admin_page(), [("Set-Cookie", f"buyback_admin={token}; HttpOnly; SameSite=Lax; Path=/")]
         return HTTPStatus.UNAUTHORIZED, self._login_page("Invalid admin username or password."), []
 
-    def _admin_token(self) -> str:
+    def _admin_token(self) -> str | None:
         username = os.environ.get("BUYBACK_ADMIN_USERNAME", "")
         password = os.environ.get("BUYBACK_ADMIN_PASSWORD", "")
+        if not username or not password:
+            return None
         secret = f"{username}:{password}".encode("utf-8")
         return hmac.new(secret, b"zelvari-buyback-admin", hashlib.sha256).hexdigest()
 
@@ -253,7 +255,7 @@ class BuybackApp:
         )
         token = cookies.get("buyback_admin", "")
         expected = self._admin_token()
-        return bool(token and expected and hmac.compare_digest(token, expected))
+        return bool(token and expected is not None and hmac.compare_digest(token, expected))
 
     def _admin_page(self, errors: list[str] | None = None) -> str:
         rows = self.store.list_pricing(active_only=False)

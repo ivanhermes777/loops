@@ -185,6 +185,28 @@ class BuybackSiteTests(unittest.TestCase):
         self.assertIn("Pricing Table", login_body)
         self.assertIn("Saved Offer Requests", login_body)
 
+    def test_admin_routes_fail_closed_with_forged_cookie_when_credentials_are_unset(self):
+        os.environ.pop("BUYBACK_ADMIN_USERNAME", None)
+        os.environ.pop("BUYBACK_ADMIN_PASSWORD", None)
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+        client.cookies["buyback_admin"] = "06700c44aaaf426a054948d7db657adee600e9550c1eda6baeb05be4d16c4891"
+        original_pricing = self.store.list_pricing(active_only=False)[0]
+        pricing_id = original_pricing["id"]
+
+        admin_status, _headers, admin_body = client.get("/admin")
+        update_status, _headers, _body = client.post(
+            "/admin/pricing/update",
+            {"id": str(pricing_id), "base_price_cents": "12345", "active": "1"},
+        )
+
+        self.assertTrue(admin_status.startswith("401"))
+        self.assertNotIn("Pricing Table", admin_body)
+        self.assertNotIn("Saved Offer Requests", admin_body)
+        self.assertTrue(update_status.startswith("401"))
+        unchanged = next(row for row in self.store.list_pricing(active_only=False) if row["id"] == pricing_id)
+        self.assertEqual(unchanged["base_price_cents"], original_pricing["base_price_cents"])
+
     def test_empty_pricing_data_shows_graceful_no_options_state(self):
         empty_db = os.path.join(self.tempdir.name, "empty.sqlite3")
         BuybackStore(empty_db)
