@@ -4,6 +4,7 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 from urllib.error import URLError
+from urllib.parse import urlencode
 from unittest.mock import patch
 
 from loops_app.app_factory import (
@@ -167,7 +168,7 @@ class AppFactoryTests(unittest.TestCase):
         self.assertEqual(findings[0].source_title, "Operations Study")
         self.assertEqual(findings[1].source_url, "https://market.test/report")
 
-    def test_hermes_agent_uses_web_tool_for_research_and_codex_session_for_generation(self):
+    def test_hermes_agent_uses_web_tool_for_research_and_constrained_codex_session_for_generation(self):
         agent = HermesCodexAgent(command="/opt/hermes", timeout_seconds=45)
         research_json = json.dumps(
             [
@@ -190,10 +191,85 @@ class AppFactoryTests(unittest.TestCase):
             findings = agent.research("AI appointment recovery")
             blueprint = agent.generate_blueprint("AI appointment recovery", findings)
 
-        self.assertEqual(run.call_args_list[0].args[0][:3], ["/opt/hermes", "-t", "web"])
-        self.assertEqual(run.call_args_list[1].args[0][0], "/opt/hermes")
-        self.assertNotIn("-t", run.call_args_list[1].args[0])
+        research_command = run.call_args_list[0].args[0]
+        generation_command = run.call_args_list[1].args[0]
+        self.assertEqual(research_command[:3], ["/opt/hermes", "chat", "--quiet"])
+        self.assertIn("--ignore-rules", research_command)
+        self.assertIn("--toolsets", research_command)
+        self.assertIn("web", research_command)
+        self.assertNotIn("-z", research_command)
+        self.assertEqual(generation_command[:3], ["/opt/hermes", "chat", "--quiet"])
+        self.assertIn("--ignore-rules", generation_command)
+        self.assertIn("--toolsets", generation_command)
+        self.assertIn("none", generation_command)
+        self.assertNotIn("-z", generation_command)
         self.assertIn("## Monetization", blueprint)
+
+    def test_cross_origin_or_missing_csrf_post_is_forbidden_before_research_or_generation(self):
+        researcher = StubResearcher(self.good_findings)
+        llm = StubLLM(self.good_blueprint)
+        app = create_app(self.storage_path, researcher=researcher, llm=llm)
+
+        blocked_requests = [
+            ("/blueprints", {"idea": "malicious cross-origin idea"}, {"HTTP_ORIGIN": "https://attacker.example"}),
+            ("/blueprints", {"idea": "missing token idea"}, {}),
+            ("/research/retry", {"pending_id": "attacker-pending"}, {"HTTP_ORIGIN": "https://attacker.example"}),
+            ("/research/continue-ai-only", {"pending_id": "attacker-pending"}, {"HTTP_ORIGIN": "https://attacker.example"}),
+        ]
+        for path, form, headers_in in blocked_requests:
+            with self.subTest(path=path, headers=headers_in):
+                body, status, headers = call_wsgi(app, "POST", path, form=form, headers=headers_in)
+                self.assertEqual(status, "403 Forbidden")
+                self.assertIn("Local admin request rejected", body)
+                self.assertEqual(headers["Content-Type"], "text/plain; charset=utf-8")
+        self.assertEqual(researcher.calls, [])
+        self.assertEqual(llm.calls, [])
+
+    def test_rendered_csrf_token_allows_intentional_admin_submit_retry_and_ai_only_continue(self):
+        weak_researcher = StubResearcher([])
+        llm = StubLLM(self.good_blueprint)
+        app = create_app(self.storage_path, researcher=weak_researcher, llm=llm)
+        token = app.admin_token
+
+        warning_body, warning_status, _ = call_wsgi(
+            app,
+            "POST",
+            "/blueprints",
+            form={"idea": "AI clinic assistant", "admin_token": token},
+        )
+
+        self.assertEqual(warning_status, "303 See Other")
+        self.assertEqual(weak_researcher.calls, ["AI clinic assistant"])
+        self.assertEqual(llm.calls, [])
+        self.assertEqual(warning_body, "")
+        self.assertIn(f'name="admin_token" value="{token}"', app.render_home())
+
+        pending_id = app.latest_result.pending_id
+        app.factory.researcher = StubResearcher(self.good_findings)
+        retry_body, retry_status, _ = call_wsgi(
+            app,
+            "POST",
+            "/research/retry",
+            form={"pending_id": pending_id, "admin_token": token},
+        )
+
+        self.assertEqual(retry_status, "303 See Other")
+        self.assertEqual(retry_body, "")
+        self.assertEqual(app.latest_result.status, "complete")
+
+        app.factory.researcher = StubResearcher([])
+        call_wsgi(app, "POST", "/blueprints", form={"idea": "AI invoice helper", "admin_token": token})
+        pending_id = app.latest_result.pending_id
+        continue_body, continue_status, _ = call_wsgi(
+            app,
+            "POST",
+            "/research/continue-ai-only",
+            form={"pending_id": pending_id, "admin_token": token},
+        )
+
+        self.assertEqual(continue_status, "303 See Other")
+        self.assertEqual(continue_body, "")
+        self.assertTrue(app.latest_result.used_ai_only_suggestions)
 
     def test_invalid_hermes_live_search_contract_is_rejected(self):
         with self.assertRaises(HermesUnavailableError):
@@ -318,19 +394,23 @@ class AppFactoryTests(unittest.TestCase):
         self.assertIn(":focus-visible", html)
         self.assertIn("grid-template-columns:1fr", html)
 
-def call_wsgi(app, method, path):
+def call_wsgi(app, method, path, *, form=None, headers=None):
     captured = {}
 
     def start_response(status, headers):
         captured["status"] = status
         captured["headers"] = dict(headers)
 
+    encoded = urlencode(form or {}).encode("utf-8")
     environ = {
         "REQUEST_METHOD": method,
         "PATH_INFO": path,
-        "CONTENT_LENGTH": "0",
-        "wsgi.input": BytesIO(b""),
+        "CONTENT_LENGTH": str(len(encoded)),
+        "CONTENT_TYPE": "application/x-www-form-urlencoded",
+        "HTTP_HOST": "127.0.0.1:8765",
+        "wsgi.input": BytesIO(encoded),
     }
+    environ.update(headers or {})
     body = b"".join(app(environ, start_response)).decode("utf-8")
     return body, captured["status"], captured["headers"]
 

@@ -11,6 +11,7 @@ import html
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import urllib.parse
@@ -157,10 +158,20 @@ class HermesCodexAgent:
         return _ensure_blueprint_structure(text, idea, findings, allow_ai_only=allow_ai_only)
 
     def _run(self, prompt: str, *, enable_web: bool) -> str:
-        command = [self.command]
-        if enable_web:
-            command.extend(["-t", "web"])
-        command.extend(["-z", prompt])
+        command = [
+            self.command,
+            "chat",
+            "--quiet",
+            "--ignore-rules",
+            "--source",
+            "app-factory",
+            "--max-turns",
+            "4" if enable_web else "1",
+            "--toolsets",
+            "web" if enable_web else "none",
+            "--query",
+            prompt,
+        ]
         try:
             completed = subprocess.run(
                 command,
@@ -320,13 +331,15 @@ class LocalApp:
     def __init__(self, factory: AppFactory):
         self.factory = factory
         self.latest_result: BlueprintResult | None = None
+        self.admin_token = secrets.token_urlsafe(32)
 
     def render_home(self) -> str:
         history_state = self.factory.history_state()
         latest = self.latest_result
         return _page_template(
             history_html=_history_html(history_state),
-            latest_html=_latest_result_html(latest),
+            latest_html=_latest_result_html(latest, self.admin_token),
+            admin_token=self.admin_token,
         )
 
     def __call__(self, environ, start_response):
@@ -334,14 +347,20 @@ class LocalApp:
         path = environ.get("PATH_INFO", "/")
         if method == "POST" and path == "/blueprints":
             form = _read_form(environ)
+            if not self._is_authorized_post(environ, form):
+                return _forbidden(start_response)
             self.latest_result = self.factory.submit_idea(form.get("idea", ""))
             return _response(start_response, "303 See Other", b"", headers=[("Location", "/")])
         if method == "POST" and path == "/research/retry":
             form = _read_form(environ)
+            if not self._is_authorized_post(environ, form):
+                return _forbidden(start_response)
             self.latest_result = self.factory.retry_research(form["pending_id"])
             return _response(start_response, "303 See Other", b"", headers=[("Location", "/")])
         if method == "POST" and path == "/research/continue-ai-only":
             form = _read_form(environ)
+            if not self._is_authorized_post(environ, form):
+                return _forbidden(start_response)
             self.latest_result = self.factory.continue_with_ai_only(form["pending_id"])
             return _response(start_response, "303 See Other", b"", headers=[("Location", "/")])
         if method == "GET" and path.startswith("/blueprints/") and path.endswith(".md"):
@@ -363,6 +382,19 @@ class LocalApp:
             return _response(start_response, "200 OK", body, headers=[("Content-Type", "text/html; charset=utf-8")])
         body = self.render_home().encode("utf-8")
         return _response(start_response, "200 OK", body, headers=[("Content-Type", "text/html; charset=utf-8")])
+
+    def _is_authorized_post(self, environ, form: dict[str, str]) -> bool:
+        token = form.get("admin_token", "")
+        if not secrets.compare_digest(token, self.admin_token):
+            return False
+        host = environ.get("HTTP_HOST", "")
+        if not _is_local_host(host):
+            return False
+        for header in ("HTTP_ORIGIN", "HTTP_REFERER"):
+            value = environ.get(header, "")
+            if value and not _is_same_local_origin(value, host):
+                return False
+        return True
 
 
 def create_app(
@@ -498,7 +530,7 @@ def _history_html(state: HistoryState) -> str:
     return f'<aside class="history-sidebar glass-panel" aria-label="Project history"><p class="eyebrow">Project History</p><h2>{html.escape(state.heading)}</h2><p>{html.escape(state.description)}</p><ul>{items}</ul></aside>'
 
 
-def _latest_result_html(result: BlueprintResult | None) -> str:
+def _latest_result_html(result: BlueprintResult | None, admin_token: str) -> str:
     if result is None:
         return ""
     if result.status == "error":
@@ -509,8 +541,8 @@ def _latest_result_html(result: BlueprintResult | None) -> str:
             '<section class="glass-panel warning"><h2>Research needs attention</h2>'
             f"<p>{html.escape(result.warning_message)}</p>{findings}"
             '<div class="actions">'
-            f'<form method="post" action="/research/retry"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Retry research</button></form>'
-            f'<form method="post" action="/research/continue-ai-only"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Continue with Hermes AI-only suggestions</button></form>'
+            f'<form method="post" action="/research/retry"><input type="hidden" name="admin_token" value="{html.escape(admin_token)}"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Retry research</button></form>'
+            f'<form method="post" action="/research/continue-ai-only"><input type="hidden" name="admin_token" value="{html.escape(admin_token)}"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Continue with Hermes AI-only suggestions</button></form>'
             "</div></section>"
         )
     findings = _research_list_html(result.research_findings)
@@ -547,7 +579,7 @@ def _research_card_html(finding: ResearchFinding) -> str:
     )
 
 
-def _page_template(*, history_html: str, latest_html: str) -> str:
+def _page_template(*, history_html: str, latest_html: str, admin_token: str) -> str:
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -630,6 +662,7 @@ def _page_template(*, history_html: str, latest_html: str) -> str:
     </div>
     <form id="idea" class="panel idea-console" method="post" action="/blueprints">
       <p class="eyebrow">Primary Idea Flow</p>
+      <input type="hidden" name="admin_token" value="{html.escape(admin_token)}">
       <label for="idea-input">App idea</label>
       <textarea id="idea-input" name="idea" placeholder="Example: AI appointment recovery assistant for small clinics"></textarea>
       <button type="submit" data-idle-label="Research and create blueprint">Research and create blueprint</button>
@@ -668,6 +701,14 @@ def _response(start_response, status: str, body: bytes, headers: list[tuple[str,
     return [body]
 
 
+def _forbidden(start_response):
+    return _response(
+        start_response,
+        "403 Forbidden",
+        b"Local admin request rejected. Refresh the local App Factory page and submit from the rendered form.",
+    )
+
+
 def _read_form(environ) -> dict[str, str]:
     size = int(environ.get("CONTENT_LENGTH") or 0)
     body = environ["wsgi.input"].read(size).decode("utf-8")
@@ -680,6 +721,20 @@ def _safe_source_url(url: str) -> str:
     if parsed.scheme in {"http", "https"} and parsed.netloc:
         return urllib.parse.urlunparse(parsed)
     return ""
+
+
+def _is_local_host(host: str) -> bool:
+    parsed = urllib.parse.urlparse(f"//{host}")
+    hostname = (parsed.hostname or "").lower()
+    return hostname in {"localhost", "127.0.0.1", "::1"}
+
+
+def _is_same_local_origin(value: str, host: str) -> bool:
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not _is_local_host(parsed.netloc):
+        return False
+    expected = urllib.parse.urlparse(f"//{host}")
+    return (parsed.hostname or "").lower() == (expected.hostname or "").lower() and parsed.port == expected.port
 
 
 def _sanitize_findings(findings: Iterable[ResearchFinding]) -> list[ResearchFinding]:
