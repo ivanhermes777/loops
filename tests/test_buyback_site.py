@@ -216,6 +216,16 @@ class BuybackSiteTests(unittest.TestCase):
             "mobile-menu-toggle",
         ]:
             self.assertIn(text, home)
+        top_section_match = re.search(r'<section class="top" id="top">(?P<section>.*?)</section>', home, re.S)
+        self.assertIsNotNone(top_section_match)
+        if top_section_match is None:
+            self.fail("Top Trade-In Values section was not rendered")
+        top_section = top_section_match.group("section")
+        self.assertEqual(top_section.count("class=\"device-visual\""), 3)
+        self.assertEqual(top_section.count("Top Pick"), 1)
+        for text in ["Model", "Storage", "Condition", "Estimated payout", "Get Quote"]:
+            self.assertIn(text, top_section)
+        self.assertIn("Based on 2 seeded demo reviews", home)
 
         dashboard_status, _headers, dashboard = client.get("/dashboard")
         self.assertTrue(dashboard_status.startswith("200"))
