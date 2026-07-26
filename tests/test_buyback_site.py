@@ -324,6 +324,172 @@ class BuybackSiteTests(unittest.TestCase):
         self.assertIn("Demo account flow complete", ok_body)
         self.assertEqual(self.store.count_demo_credentials(), 0)
 
+    def test_seller_submission_recalculates_tampered_payout_and_blocks_ineligible_answers(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+
+        payload = {
+            "brand": "Apple iPhone",
+            "model": "iPhone 15 Pro Max",
+            "storage": "256GB",
+            "carrier": "Unlocked",
+            "condition": "Good",
+            "estimated_payout_cents": "999999",
+            "full_name": "Tamper Tester",
+            "email": "tamper@example.com",
+            "phone": "555-555-1000",
+            "street_address": "123 Main St",
+            "apartment": "",
+            "city": "Denver",
+            "state": "CO",
+            "zip_code": "80202",
+            "payout_method": "PayPal",
+            "terms_agree": "1",
+            "privacy_agree": "1",
+        }
+        expected = calculate_offer(
+            self.store,
+            brand="Apple iPhone",
+            model="iPhone 15 Pro Max",
+            storage="256GB",
+            carrier="Unlocked",
+            condition="Good",
+        )["offer_cents"]
+
+        status, _headers, body = client.post("/seller", payload)
+
+        self.assertTrue(status.startswith("200"), body)
+        saved = self.store.list_orders()[0]
+        self.assertEqual(saved["estimated_payout_cents"], expected)
+        self.assertNotEqual(saved["estimated_payout_cents"], 999999)
+
+        blocked_status, _headers, blocked_body = client.post(
+            "/seller",
+            {**payload, "email": "blocked@example.com", "lost_stolen": "yes"},
+        )
+
+        self.assertTrue(blocked_status.startswith("400"))
+        self.assertIn("Zelvari cannot accept this device", blocked_body)
+        self.assertEqual(len(self.store.list_orders()), 1)
+
+    def test_home_renders_working_catalog_questionnaire_results_and_accessible_mobile_script(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+
+        status, _headers, home = client.get("/")
+
+        self.assertTrue(status.startswith("200"))
+        for text in [
+            "data-catalog-search",
+            "data-catalog-brand",
+            "data-catalog-model",
+            "data-catalog-storage",
+            "data-catalog-sort",
+            "data-load-more",
+            "data-question-key=\"lost_stolen\"",
+            "data-answer=\"yes\"",
+            "questionnaireAnswers",
+            "refreshQuestionnaire",
+            "refreshCatalog",
+            "refreshQuoteReview",
+            "seller_brand",
+            "seller_model",
+            "seller_storage",
+            "seller_estimated_payout_cents",
+            "aria-expanded",
+        ]:
+            self.assertIn(text, home)
+        self.assertNotIn("Phone visual, brand, model, storage, carrier, condition, estimated payout, offer expiration date, and adjustment summary appear before acceptance.", home)
+
+    def test_admin_search_filters_by_customer_quote_number_and_safe_no_results(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+        os.environ["BUYBACK_ADMIN_USERNAME"] = "michael"
+        os.environ["BUYBACK_ADMIN_PASSWORD"] = "safe-password"
+        self.addCleanup(os.environ.pop, "BUYBACK_ADMIN_USERNAME", None)
+        self.addCleanup(os.environ.pop, "BUYBACK_ADMIN_PASSWORD", None)
+        client.post("/admin/login", {"username": "michael", "password": "safe-password"})
+        first = self.store.create_order(
+            {
+                "brand": "Apple iPhone",
+                "model": "iPhone 15 Pro Max",
+                "storage": "256GB",
+                "carrier": "Unlocked",
+                "condition": "Good",
+                "estimated_payout_cents": 71500,
+                "full_name": "Jane Searchable",
+                "email": "jane@example.com",
+                "phone": "555-222-3333",
+                "street_address": "123 Main St",
+                "apartment": "",
+                "city": "Denver",
+                "state": "CO",
+                "zip_code": "80202",
+                "payout_method": "Venmo",
+                "adjustment_summary": "Good condition",
+            }
+        )
+        self.store.create_order(
+            {
+                "brand": "Samsung Galaxy",
+                "model": "Galaxy S24 Ultra",
+                "storage": "512GB",
+                "carrier": "Verizon",
+                "condition": "Like New",
+                "estimated_payout_cents": 62000,
+                "full_name": "Bob Hidden",
+                "email": "bob@example.com",
+                "phone": "555-444-3333",
+                "street_address": "99 Side St",
+                "apartment": "",
+                "city": "Denver",
+                "state": "CO",
+                "zip_code": "80202",
+                "payout_method": "PayPal",
+                "adjustment_summary": "Like New condition",
+            }
+        )
+
+        customer_status, _headers, customer_body = client.get("/admin", query="customer=Jane")
+        quote_status, _headers, quote_body = client.get("/admin", query=f"quote_number={first['quote_number'][-4:]}")
+        empty_status, _headers, empty_body = client.get("/admin", query="customer=NoSuchCustomer&quote_number=NOPE")
+
+        self.assertTrue(customer_status.startswith("200"))
+        self.assertIn("Jane Searchable", customer_body)
+        self.assertNotIn("Bob Hidden", customer_body)
+        self.assertTrue(quote_status.startswith("200"))
+        self.assertIn(first["quote_number"], quote_body)
+        self.assertTrue(empty_status.startswith("200"))
+        self.assertIn("No admin quote results match those filters.", empty_body)
+        self.assertNotIn("Jane Searchable", empty_body)
+
+    def test_route_specific_demo_auth_and_support_search_are_functional_demo_flows(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+
+        forgot_status, _headers, forgot = client.get("/forgot-password")
+        bad_forgot_status, _headers, bad_forgot = client.post("/forgot-password", {"email": "bad-email"})
+        ok_forgot_status, _headers, ok_forgot = client.post("/forgot-password", {"email": "customer@example.com"})
+        signin_status, _headers, signin = client.get("/signin")
+        support_status, _headers, support = client.get("/support")
+
+        self.assertTrue(forgot_status.startswith("200"))
+        self.assertIn("Forgot Password", forgot)
+        self.assertIn("Demo reset link", forgot)
+        self.assertNotIn("Password must be at least 8 characters", forgot)
+        self.assertTrue(bad_forgot_status.startswith("400"))
+        self.assertIn("Enter a valid email", bad_forgot)
+        self.assertTrue(ok_forgot_status.startswith("200"))
+        self.assertIn("Demo password reset flow complete", ok_forgot)
+        self.assertTrue(signin_status.startswith("200"))
+        self.assertIn("Sign In", signin)
+        self.assertIn("customer accounts are not active yet", signin)
+        self.assertTrue(support_status.startswith("200"))
+        self.assertIn("data-help-search", support)
+        self.assertIn("data-help-article", support)
+        self.assertIn("data-help-empty", support)
+        self.assertIn("filterHelpArticles", support)
+
 
 if __name__ == "__main__":
     unittest.main()

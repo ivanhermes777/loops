@@ -18,6 +18,7 @@ from .buyback import (
     PAYOUT_METHODS,
     SUPPORTED_CONDITIONS,
     BuybackStore,
+    calculate_condition_offer,
     calculate_offer,
     seed_sample_data,
     seed_sample_pricing,
@@ -64,9 +65,9 @@ class BuybackApp:
             if method == "GET" and path == "/dashboard":
                 return self._send(start_response, HTTPStatus.OK, self._dashboard_page())
             if method == "GET" and path in {"/signin", "/signup", "/forgot-password", "/verify-email", "/secure-sessions", "/signout"}:
-                return self._send(start_response, HTTPStatus.OK, self._auth_page())
+                return self._send(start_response, HTTPStatus.OK, self._auth_page(path=path))
             if method == "POST" and path in {"/signin", "/signup", "/forgot-password"}:
-                status, body = self._demo_auth_submit(self._form_data(environ))
+                status, body = self._demo_auth_submit(self._form_data(environ), path=path)
                 return self._send(start_response, status, body)
             if method == "GET" and path == "/support":
                 return self._send(start_response, HTTPStatus.OK, self._support_page())
@@ -81,7 +82,7 @@ class BuybackApp:
             if method == "GET" and path == "/admin":
                 if not self._is_admin(environ):
                     return self._send(start_response, HTTPStatus.UNAUTHORIZED, self._login_page("Admin login required"))
-                return self._send(start_response, HTTPStatus.OK, self._admin_page())
+                return self._send(start_response, HTTPStatus.OK, self._admin_page(filters=self._query_data(environ)))
             if method == "POST" and path == "/admin/pricing/update":
                 if not self._is_admin(environ):
                     return self._send(start_response, HTTPStatus.UNAUTHORIZED, self._login_page("Admin login required"))
@@ -107,6 +108,9 @@ class BuybackApp:
         content_length = int(environ.get("CONTENT_LENGTH") or 0)
         raw_body = environ["wsgi.input"].read(content_length).decode("utf-8")
         return {key: values[0] for key, values in parse_qs(raw_body, keep_blank_values=True).items()}
+
+    def _query_data(self, environ: dict) -> dict[str, str]:
+        return {key: values[0] for key, values in parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True).items()}
 
     def _home_page(self, errors: list[str] | None = None) -> str:
         pricing = self.store.list_pricing(active_only=True)
@@ -147,9 +151,9 @@ class BuybackApp:
         </section>
         <section class="steps glass" id="how"><h2>How It Works</h2>{''.join(f'<article><div class="icon">{i}</div><h3>{title}</h3><p>{copy}</p></article>' for i, (title, copy) in enumerate([('Choose Your Device','Tell us your model and condition.'),('Get an Instant Offer','Receive a demo AI-powered quote in seconds.'),('Ship It for Free','A prepaid label would be sent manually.'),('Get Paid Fast','Inspection and payout are handled manually.')], 1))}</section>
         <section class="brand-grid"><h2>Popular Brands</h2>{brand_cards}</section>
-        <section class="catalog glass"><h2>Phone Catalog</h2><p>Prices are estimates and may change after inspection.</p><div class="catalog-tools"><input aria-label="Search phones" placeholder="Search phones"><select aria-label="Brand filter"><option>Brand filter</option></select><select aria-label="Model filter"><option>Model filter</option></select><select aria-label="Storage filter"><option>Storage filter</option></select><select aria-label="Sort catalog"><option>Sort by highest payout</option><option>Sort by newest</option></select></div><div class="cards">{catalog_cards}</div><div class="empty-state">No catalog matches. Reset filters or choose Other Brands for manual review.</div><button class="btn ghost">Load More</button></section>
-        <section class="questionnaire glass"><h2>Device Condition Questionnaire</h2><div class="progress"><span style="width:50%"></span></div>{''.join(f'<article class="question"><h3>{html.escape(text)}</h3><button>Yes</button><button>No</button></article>' for _key, text in QUESTIONNAIRE)}<div class="blocked"><h3>Zelvari cannot accept this device</h3><p>Only legally eligible devices can be sold. You can edit answers before continuing.</p></div><div class="adjustments"><h3>Value Adjustment Summary</h3><p>Condition, carrier, screen, back glass, water damage, non-working value, and promotional bonus are explained here.</p></div></section>
-        <section class="results glass"><h2>Eligible Quote Results</h2><p>Phone visual, brand, model, storage, carrier, condition, estimated payout, offer expiration date, and adjustment summary appear before acceptance.</p><p>Your final payout may change after the device is inspected.</p><a class="btn primary" href="#seller">Accept Offer</a><a class="btn ghost" href="#quote">Edit Device Details</a></section>
+        <section class="catalog glass"><h2>Phone Catalog</h2><p>Prices are estimates and may change after inspection.</p><div class="catalog-tools"><input data-catalog-search aria-label="Search phones" placeholder="Search phones"><select data-catalog-brand aria-label="Brand filter"><option value="">All brands</option></select><select data-catalog-model aria-label="Model filter"><option value="">All models</option></select><select data-catalog-storage aria-label="Storage filter"><option value="">All storage</option></select><select data-catalog-sort aria-label="Sort catalog"><option value="payout">Sort by highest payout</option><option value="newest">Sort by newest</option></select></div><div class="cards" data-catalog-cards>{catalog_cards}</div><div class="empty-state" data-catalog-empty>No catalog matches. Reset filters or choose Other Brands for manual review.</div><button class="btn ghost" type="button" data-load-more>Load More</button></section>
+        <section class="questionnaire glass" id="condition-flow"><h2>Device Condition Questionnaire</h2><p>Answer each item to keep the offer accurate before acceptance.</p><div class="progress"><span data-question-progress style="width:0%"></span></div><p data-question-count>0 of {len(QUESTIONNAIRE)} answered</p>{''.join(f'<article class="question" data-question-key="{html.escape(key)}"><h3>{html.escape(text)}</h3><button type="button" data-answer="yes">Yes</button><button type="button" data-answer="no">No</button></article>' for key, text in QUESTIONNAIRE)}<div class="blocked" data-blocked hidden><h3>Zelvari cannot accept this device</h3><p>Only legally eligible devices can be sold. You can edit answers before continuing.</p><a class="btn ghost" href="#condition-flow">Edit answers</a></div><div class="adjustments"><h3>Value Adjustment Summary</h3><p data-adjustment-summary>Choose a device and answer condition questions to see deductions or bonuses.</p></div></section>
+        <section class="results glass" id="quote-review"><h2>Eligible Quote Results</h2><div class="device-visual" aria-hidden="true"></div><p><strong data-review-device>Select a device to review your offer.</strong></p><p>Storage: <span data-review-storage>—</span> · Carrier: <span data-review-carrier>—</span> · Condition: <span data-review-condition>—</span></p><p>Estimated payout: <strong data-review-payout>Pricing unavailable</strong></p><p>Offer expires: <span data-review-expiration>14 days from today</span></p><p data-review-adjustments>Adjustment summary will update as you answer.</p><p>Your final payout may change after the device is inspected.</p><a class="btn primary" data-accept-offer href="#seller">Accept Offer</a><a class="btn ghost" href="#quote">Edit Device Details</a></section>
         {self._seller_form()}
         <section class="why" id="about"><h2>Why Choose Zelvari</h2>{''.join(f'<article class="glass"><h3>{title}</h3><p>{copy}</p></article>' for title, copy in [('Fast Payment','Get paid quickly after inspection.'),('Free Shipping','Prepaid demo shipping path.'),('Trusted Quotes','AI pricing plus human review.'),('Secure Data Protection','Prepare and wipe your data safely.'),('Better for the Planet','Responsible resale keeps tech useful.')])}</section>
         <section class="top" id="top"><h2>Top Trade-In Values</h2><div class="cards"><article class="phone-card"><b>Top Pick</b><h3>Premium Ultra 1TB</h3><p>Mint Condition</p><strong>$890</strong><a href="#quote">Get Quote</a></article><article class="phone-card"><h3>Pro Max 512GB</h3><p>Excellent Condition</p><strong>$720</strong><a href="#quote">Get Quote</a></article><article class="phone-card"><h3>Galaxy S24 Ultra</h3><p>512GB · Excellent</p><strong>$650</strong><a href="#quote">Get Quote</a></article></div></section>
@@ -164,14 +168,14 @@ class BuybackApp:
             return ""
         cards = []
         for row in pricing[:8]:
-            cards.append(f"<article class='phone-card'><div class='device-visual'></div><p>{html.escape(row['brand'])}</p><h3>{html.escape(row['model'])}</h3><p>{html.escape(row['storage'])}</p><strong>{_money(row['maximum_payout_cents'])}</strong><a href='#quote'>Get Quote</a></article>")
+            cards.append(f"<article class='phone-card' data-catalog-card data-brand='{html.escape(row['brand'])}' data-model='{html.escape(row['model'])}' data-storage='{html.escape(row['storage'])}' data-payout='{int(row['maximum_payout_cents'])}' data-newest='{int(row.get('newest_rank', 0))}'><div class='device-visual'></div><p>{html.escape(row['brand'])}</p><h3>{html.escape(row['model'])}</h3><p>{html.escape(row['storage'])}</p><strong>{_money(row['maximum_payout_cents'])}</strong><button class='btn ghost' type='button' data-get-quote>Get Quote</button></article>")
         return "".join(cards)
 
     def _seller_form(self) -> str:
         payout_options = "".join(f"<option>{method}</option>" for method in PAYOUT_METHODS)
         return f"""
         <section class="seller glass" id="seller"><h2>Seller Information</h2><p>Guest checkout is allowed. Account creation is offered as a demo-only next step.</p><form method="post" action="/seller" class="form-grid">
-        <input type="hidden" name="brand" value="Apple iPhone"><input type="hidden" name="model" value="iPhone 15 Pro Max"><input type="hidden" name="storage" value="256GB"><input type="hidden" name="carrier" value="Unlocked"><input type="hidden" name="condition" value="Good"><input type="hidden" name="estimated_payout_cents" value="67600">
+        <input type="hidden" name="brand" id="seller_brand"><input type="hidden" name="model" id="seller_model"><input type="hidden" name="storage" id="seller_storage"><input type="hidden" name="carrier" id="seller_carrier"><input type="hidden" name="condition" id="seller_condition"><input type="hidden" name="estimated_payout_cents" id="seller_estimated_payout_cents">{''.join(f'<input type="hidden" name="{html.escape(key)}" id="seller_{html.escape(key)}" value="no">' for key, _text in QUESTIONNAIRE)}<input type="hidden" name="legally_ineligible" id="seller_legally_ineligible" value="no">
         <label>Full Name<input name="full_name" required></label><label>Email<input type="email" name="email" required></label><label>Phone Number<input name="phone" required></label><label>Street Address<input name="street_address" required></label><label>Apartment/Unit<input name="apartment"></label><label>City<input name="city" required></label><label>State<input name="state" required></label><label>ZIP Code<input name="zip_code" required></label><label>Preferred Payout Method<select name="payout_method" required>{payout_options}</select></label><label class="check"><input type="checkbox" name="terms_agree" value="1"> I agree to the terms.</label><label class="check"><input type="checkbox" name="privacy_agree" value="1"> I agree to the privacy policy.</label><button class="btn primary" type="submit">Accept Offer</button></form></section>
         """
 
@@ -180,17 +184,22 @@ class BuybackApp:
 
     def _submit_seller(self, data: dict[str, str]) -> tuple[HTTPStatus, str]:
         errors = validate_seller_fields(data)
+        answers = {key: data.get(key, "no") for key, _text in QUESTIONNAIRE}
+        answers["legally_ineligible"] = data.get("legally_ineligible", "no")
         try:
-            offer = calculate_offer(self.store, brand=data.get("brand", ""), model=data.get("model", ""), storage=data.get("storage", ""), carrier=data.get("carrier", "Unlocked"), condition=data.get("condition", "Good")) if not errors else None
+            offer = calculate_condition_offer(self.store, brand=data.get("brand", ""), model=data.get("model", ""), storage=data.get("storage", ""), carrier=data.get("carrier", "Unlocked"), condition=data.get("condition", "Good"), answers=answers) if not errors else None
         except ValueError as error:
             errors.append(str(error))
             offer = None
+        if offer and not offer.get("eligible", True):
+            errors.append(offer.get("block_message", "Zelvari cannot accept this device"))
+            errors.append(offer.get("block_explanation", "Only legally eligible devices can be sold."))
         if errors:
             return HTTPStatus.BAD_REQUEST, self._home_page(errors)
         assert offer is not None
         order = self.store.create_order({
             "brand": data["brand"].strip(), "model": data["model"].strip(), "storage": data["storage"].strip(), "carrier": data.get("carrier", "Unlocked").strip(), "condition": data["condition"].strip(),
-            "estimated_payout_cents": int(data.get("estimated_payout_cents") or offer["offer_cents"]), "adjustment_summary": offer["adjustment_summary"],
+            "estimated_payout_cents": int(offer["offer_cents"]), "adjustment_summary": offer["adjustment_summary"],
             "full_name": data["full_name"].strip(), "email": data["email"].strip(), "phone": data["phone"].strip(), "street_address": data["street_address"].strip(), "apartment": data.get("apartment", "").strip(), "city": data["city"].strip(), "state": data["state"].strip(), "zip_code": data["zip_code"].strip(), "payout_method": data["payout_method"].strip(),
         })
         return HTTPStatus.OK, self._page("Confirmation", f"<section class='card success'><p class='badge'>Request received</p><h1>Quote/order number {html.escape(order['quote_number'])}</h1><p>Zelvari will follow up manually with shipping and inspection next steps.</p><p>Customer accounts are demo-only and not required for guest checkout.</p><a class='btn primary' href='/dashboard'>View Demo Dashboard</a><a class='btn ghost' href='/signup'>Create Demo Account</a></section>{self._footer()}")
@@ -201,25 +210,44 @@ class BuybackApp:
         timeline_html = "".join(f"<li>{item}</li>" for item in TIMELINE)
         return self._page("Customer Dashboard", f"<section class='glass'><h1>Customer Demo Dashboard</h1><div class='cards'>{tile_html}</div><h2>Order Timeline</h2><ol class='timeline'>{timeline_html}</ol></section>{self._footer()}")
 
-    def _auth_page(self, message: str = "") -> str:
+    def _auth_page(self, message: str = "", path: str = "/signup") -> str:
         notice = f"<p class='success'>{html.escape(message)}</p>" if message else ""
-        return self._page("Demo Auth", f"<section class='glass narrow'><h1>Demo Customer Account Flows</h1>{notice}<p>These Sign Up, Sign In, Forgot Password, Email Verification, Secure Sessions, and Sign Out screens validate fields, but customer accounts are not active yet and customer login credentials are not stored.</p><form method='post' action='/signup'><label>Email<input name='email' type='email'></label><label>Password<input name='password' type='password'></label><button class='btn primary'>Sign Up</button></form><a href='/signin'>Sign In</a> · <a href='/forgot-password'>Forgot Password</a> · <a href='/verify-email'>Email Verification</a> · <a href='/secure-sessions'>Secure Sessions</a> · <a href='/signout'>Sign Out</a></section>")
+        titles = {
+            "/signup": "Sign Up",
+            "/signin": "Sign In",
+            "/forgot-password": "Forgot Password",
+            "/verify-email": "Email Verification",
+            "/secure-sessions": "Secure Sessions",
+            "/signout": "Sign Out",
+        }
+        title = titles.get(path, "Sign Up")
+        if path == "/forgot-password":
+            form = "<p>Demo reset link requests validate email only. No customer account is active yet.</p><form method='post' action='/forgot-password'><label>Email<input name='email' type='email'></label><button class='btn primary'>Send Demo Reset Link</button></form>"
+        elif path in {"/verify-email", "/secure-sessions", "/signout"}:
+            form = f"<p>{title} is a polished demo-only screen. Customer accounts are not active yet, sessions are illustrative, and customer login credentials are not stored.</p><a class='btn primary' href='/signin'>Back to Sign In</a>"
+        else:
+            button = "Sign In" if path == "/signin" else "Sign Up"
+            form = f"<form method='post' action='{path}'><label>Email<input name='email' type='email'></label><label>Password<input name='password' type='password'></label><button class='btn primary'>{button}</button></form>"
+        return self._page("Demo Auth", f"<section class='glass narrow'><h1>{title}</h1>{notice}<p>These Sign Up, Sign In, Forgot Password, Email Verification, Secure Sessions, and Sign Out screens validate fields, but customer accounts are not active yet and customer login credentials are not stored.</p>{form}<a href='/signup'>Sign Up</a> · <a href='/signin'>Sign In</a> · <a href='/forgot-password'>Forgot Password</a> · <a href='/verify-email'>Email Verification</a> · <a href='/secure-sessions'>Secure Sessions</a> · <a href='/signout'>Sign Out</a></section>")
 
-    def _demo_auth_submit(self, data: dict[str, str]) -> tuple[HTTPStatus, str]:
+    def _demo_auth_submit(self, data: dict[str, str], path: str = "/signup") -> tuple[HTTPStatus, str]:
         errors = []
         if "@" not in data.get("email", ""):
             errors.append("Enter a valid email")
-        if len(data.get("password", "")) < 8:
+        if path != "/forgot-password" and len(data.get("password", "")) < 8:
             errors.append("Password must be at least 8 characters")
         if errors:
             return HTTPStatus.BAD_REQUEST, self._page("Demo Auth", f"<section class='glass narrow'>{self._error_list(errors)}<p>customer accounts are not active yet</p></section>")
-        return HTTPStatus.OK, self._auth_page("Demo account flow complete. Customer login credentials were not stored.")
+        if path == "/forgot-password":
+            return HTTPStatus.OK, self._auth_page("Demo password reset flow complete. Customer login credentials were not stored.", path=path)
+        return HTTPStatus.OK, self._auth_page("Demo account flow complete. Customer login credentials were not stored.", path=path)
 
     def _support_page(self, message: str = "") -> str:
         notice = f"<p class='error'>{html.escape(message)}</p>" if message else ""
         topics = ['value calculation','free shipping','inspection timing','value changes','payment methods','broken phones','data removal','activation lock','sale cancellation']
-        topic_html = "".join(f"<article><h2>{topic}</h2><p>Helpful demo guidance for {topic.lower()}.</p></article>" for topic in topics)
-        return self._page("Support Center", f"<section class='glass'><h1>Support Center</h1><p>searchable help articles, FAQs, contact form, quote-status lookup, shipping help, payment help, and device preparation instructions.</p>{notice}<input aria-label='Search help' placeholder='Search help articles'><form method='post' action='/support/lookup'><label>quote-status lookup<input name='quote_number'></label><button class='btn primary'>Look Up Quote</button></form><div class='cards'>{topic_html}</div><form><label>Contact form<textarea></textarea></label></form><h2>Shipping Help</h2><p>shipping help: package your phone safely.</p><h2>Payment Help</h2><p>payment help: PayPal, Venmo, bank transfer, digital prepaid card, mailed check.</p><h2>Device Preparation</h2><p>device preparation: back up data, remove locks, erase device.</p></section>{self._footer()}")
+        topic_html = "".join(f"<article data-help-article><h2>{topic}</h2><p>Helpful demo guidance for {topic.lower()}.</p></article>" for topic in topics)
+        support_script = """<script>function filterHelpArticles(){const q=(document.querySelector('[data-help-search]')?.value||'').toLowerCase();let shown=0;document.querySelectorAll('[data-help-article]').forEach(article=>{const match=article.innerText.toLowerCase().includes(q);article.hidden=!match;if(match) shown++;});document.querySelector('[data-help-empty]')?.toggleAttribute('hidden',shown!==0);}document.querySelector('[data-help-search]')?.addEventListener('input',filterHelpArticles);filterHelpArticles();</script>"""
+        return self._page("Support Center", f"<section class='glass'><h1>Support Center</h1><p>searchable help articles, FAQs, contact form, quote-status lookup, shipping help, payment help, and device preparation instructions.</p>{notice}<input data-help-search aria-label='Search help' placeholder='Search help articles'><form method='post' action='/support/lookup'><label>quote-status lookup<input name='quote_number'></label><button class='btn primary'>Look Up Quote</button></form><div class='cards'>{topic_html}</div><p data-help-empty hidden>No help articles match that search.</p><form><label>Contact form<textarea></textarea></label></form><h2>Shipping Help</h2><p>shipping help: package your phone safely.</p><h2>Payment Help</h2><p>payment help: PayPal, Venmo, bank transfer, digital prepaid card, mailed check.</p><h2>Device Preparation</h2><p>device preparation: back up data, remove locks, erase device.</p></section>{self._footer()}{support_script}")
 
     def _lookup_quote(self, data: dict[str, str]) -> tuple[HTTPStatus, str]:
         quote = self.store.get_order(data.get("quote_number", ""))
@@ -254,14 +282,26 @@ class BuybackApp:
         token = cookies.get("buyback_admin", "")
         return bool(token and expected and hmac.compare_digest(token, expected))
 
-    def _admin_page(self, errors: list[str] | None = None) -> str:
+    def _admin_page(self, errors: list[str] | None = None, filters: dict[str, str] | None = None) -> str:
+        filters = filters or {}
+        customer_query = filters.get("customer", "").strip().lower()
+        quote_query = filters.get("quote_number", "").strip().upper()
         stats = self.store.admin_stats()
         stat_html = "".join(f"<article><strong>{label}</strong><span>{value}</span></article>" for label, value in [
             ("Total Quotes", stats["total_quotes"]), ("Accepted Quotes", stats["accepted_quotes"]), ("Devices Received", stats["devices_received"]), ("Devices Inspected", stats["devices_inspected"]), ("Payments Sent", stats["payments_sent"]), ("Average Payout", _money(stats["average_payout_cents"])), ("Conversion Rate", f"{stats['conversion_rate']}%"), ("Total Buyback Value", _money(stats["total_buyback_value_cents"])),
         ])
         pricing_rows = "".join(f"<tr><td>{html.escape(row['brand'])}</td><td>{html.escape(row['model'])}</td><td>{html.escape(row['storage'])}</td><td>{_money(row['maximum_payout_cents'])}</td><td><form method='post' action='/admin/pricing/update'><input type='hidden' name='id' value='{row['id']}'><input name='base_value_cents' type='number' value='{row['base_value_cents']}'><input name='maximum_payout_cents' type='number' value='{row['maximum_payout_cents']}'><label><input type='checkbox' name='active' value='1' {'checked' if row['active'] else ''}> Active</label><button>Save</button></form></td></tr>" for row in self.store.list_pricing()) or "<tr><td colspan='5'>No pricing records yet.</td></tr>"
-        order_rows = "".join(f"<tr><td>{html.escape(row['quote_number'])}</td><td>{html.escape(row['full_name'])}<br>{html.escape(row['email'])}</td><td>{html.escape(row['status'])}</td><td>{_money(row['estimated_payout_cents'])}</td><td><form method='post' action='/admin/order/update'><input name='quote_number' value='{html.escape(row['quote_number'])}'><select name='status'>{''.join(f'<option>{item}</option>' for item in TIMELINE)}</select><input name='inspection_result' placeholder='inspection result'><input name='internal_notes' placeholder='internal notes'><select name='decision'><option>Pending</option><option>Approved</option><option>Rejected</option></select><input name='final_payout_cents' type='number'><label><input type='checkbox' name='payment_sent' value='1'> mark payments as sent</label><button>Update</button></form></td></tr>" for row in self.store.list_orders()) or "<tr><td colspan='5'>No saved offer requests yet. Empty quote table.</td></tr>"
-        return self._page("Buyback Admin", f"<section class='glass admin'><h1>Admin Dashboard</h1>{self._error_list(errors or [])}<div class='stats'>{stat_html}</div><h2>Quotes</h2><input placeholder='search customers'><input placeholder='search by quote number'><table>{order_rows}</table><h2>Editable Pricing Rows</h2><table>{pricing_rows}</table><h2>Management Areas</h2><div class='cards'><article><h3>Phone brands/models</h3><p>Seeded/admin-visible content.</p></article><article><h3>Reviews</h3><p>Seeded mock reviews.</p></article><article><h3>FAQs</h3><p>Seeded support FAQs.</p></article></div></section>")
+        orders = self.store.list_orders()
+        if customer_query:
+            orders = [row for row in orders if customer_query in " ".join([row.get("full_name", ""), row.get("email", ""), row.get("phone", "")]).lower()]
+        if quote_query:
+            orders = [row for row in orders if quote_query in row.get("quote_number", "").upper()]
+        order_rows = "".join(f"<tr><td>{html.escape(row['quote_number'])}</td><td>{html.escape(row['full_name'])}<br>{html.escape(row['email'])}<br>{html.escape(row['phone'])}</td><td>{html.escape(row['status'])}</td><td>{_money(row['estimated_payout_cents'])}</td><td><form method='post' action='/admin/order/update'><input name='quote_number' value='{html.escape(row['quote_number'])}'><select name='status'>{''.join(f'<option>{item}</option>' for item in TIMELINE)}</select><input name='inspection_result' placeholder='inspection result'><input name='internal_notes' placeholder='internal notes'><select name='decision'><option>Pending</option><option>Approved</option><option>Rejected</option></select><input name='final_payout_cents' type='number'><label><input type='checkbox' name='payment_sent' value='1'> mark payments as sent</label><button>Update</button></form></td></tr>" for row in orders)
+        if not order_rows:
+            order_rows = "<tr><td colspan='5'>No admin quote results match those filters.</td></tr>" if (customer_query or quote_query) else "<tr><td colspan='5'>No saved offer requests yet. Empty quote table.</td></tr>"
+        customer_value = html.escape(filters.get("customer", ""))
+        quote_value = html.escape(filters.get("quote_number", ""))
+        return self._page("Buyback Admin", f"<section class='glass admin'><h1>Admin Dashboard</h1>{self._error_list(errors or [])}<div class='stats'>{stat_html}</div><h2>Quotes</h2><form method='get' action='/admin' class='catalog-tools'><label>Search customers<input name='customer' placeholder='search customers' value='{customer_value}'></label><label>Search by quote number<input name='quote_number' placeholder='search by quote number' value='{quote_value}'></label><button class='btn primary'>Search</button><a class='btn ghost' href='/admin'>Reset</a></form><table>{order_rows}</table><h2>Editable Pricing Rows</h2><table>{pricing_rows}</table><h2>Management Areas</h2><div class='cards'><article><h3>Phone brands/models</h3><p>Seeded/admin-visible content.</p></article><article><h3>Reviews</h3><p>Seeded mock reviews.</p></article><article><h3>FAQs</h3><p>Seeded support FAQs.</p></article></div></section>")
 
     def _update_pricing(self, data: dict[str, str]) -> tuple[HTTPStatus, str]:
         try:
@@ -282,14 +322,27 @@ class BuybackApp:
         return f"""
         const catalog = {catalog_json};
         const conditions = {json.dumps(list(SUPPORTED_CONDITIONS.keys()))};
-        const fields = ['brand','model','storage','condition'].reduce((acc,id)=>{{acc[id]=document.getElementById(id);return acc;}},{{}});
+        const questionKeys = {json.dumps([key for key, _text in QUESTIONNAIRE])};
+        const ineligibleKeys = ['lost_stolen','financed','account_lock','legally_ineligible'];
+        const questionnaireAnswers = Object.fromEntries(questionKeys.map(key=>[key,'']));
+        let visibleCount = 8;
+        const fields = ['brand','model','storage','carrier','condition'].reduce((acc,id)=>{{acc[id]=document.getElementById(id);return acc;}},{{}});
+        const money = cents => '$'+(Math.max(0,cents)/100).toLocaleString(undefined,{{maximumFractionDigits:0}});
         function unique(values){{return [...new Set(values)].sort();}}
-        function options(select, values){{ if(!select) return; select.innerHTML=values.map(v=>`<option value="${{v}}">${{v}}</option>`).join(''); }}
+        function options(select, values, label){{ if(!select) return; const prefix=label!==undefined?`<option value="">${{label}}</option>`:''; select.innerHTML=prefix+values.map(v=>`<option value="${{v}}">${{v}}</option>`).join(''); }}
+        function currentRow(){{return catalog.find(r=>r.brand===fields.brand?.value&&r.model===fields.model?.value&&r.storage===fields.storage?.value);}}
+        function calculateClientOffer(){{ const row=currentRow(); if(!row) return null; let cents; const adjustments=[fields.condition.value+' condition']; if(fields.condition.value==='Not Working'){{ cents=row.non_working_value_cents; adjustments.push('Not Working value applied'); }} else {{ cents=row.base_value_cents; const deductions={{'Brand New':0,'Like New':3000,'Good':row.condition_deduction_cents,'Fair':16000,'Damaged':30000}}; const deduction=deductions[fields.condition.value]||0; cents-=deduction; if(deduction) adjustments.push('Condition deduction -'+money(deduction)); }} if(fields.carrier.value==='Unlocked'&&row.carrier_adjustment_cents){{ cents+=row.carrier_adjustment_cents; adjustments.push('Unlocked carrier bonus +'+money(row.carrier_adjustment_cents)); }} if(questionnaireAnswers.cracked_screen==='yes'){{ cents-=row.screen_damage_deduction_cents; adjustments.push('Cracked screen -'+money(row.screen_damage_deduction_cents)); }} if(questionnaireAnswers.cracked_back_glass==='yes'){{ cents-=row.back_glass_deduction_cents; adjustments.push('Cracked back glass -'+money(row.back_glass_deduction_cents)); }} if(questionnaireAnswers.water_damage==='yes'){{ cents-=row.water_damage_deduction_cents; adjustments.push('Water damage -'+money(row.water_damage_deduction_cents)); }} if(questionnaireAnswers.deep_scratches==='yes'){{ cents-=2500; adjustments.push('Deep scratches -$25'); }} if(row.promotional_bonus_cents){{ cents+=row.promotional_bonus_cents; adjustments.push('Promotional bonus +'+money(row.promotional_bonus_cents)); }} cents=Math.max(0,Math.min(row.maximum_payout_cents,cents)); return {{row,cents,adjustments}};}}
+        function syncSellerFields(offer){{ [['seller_brand',fields.brand?.value],['seller_model',fields.model?.value],['seller_storage',fields.storage?.value],['seller_carrier',fields.carrier?.value],['seller_condition',fields.condition?.value],['seller_estimated_payout_cents',offer?offer.cents:0]].forEach(([id,value])=>{{const el=document.getElementById(id); if(el) el.value=value||'';}}); questionKeys.forEach(key=>{{const el=document.getElementById('seller_'+key); if(el) el.value=questionnaireAnswers[key]||'no';}}); }}
+        function refreshQuoteReview(){{ const offer=calculateClientOffer(); const estimate=document.getElementById('estimate'); const hidden=document.getElementById('estimated_payout_cents'); const blocked=ineligibleKeys.some(key=>questionnaireAnswers[key]==='yes'); const accept=document.querySelector('[data-accept-offer]'); document.querySelector('[data-blocked]')?.toggleAttribute('hidden',!blocked); if(accept){{accept.toggleAttribute('hidden',blocked); accept.setAttribute('aria-disabled',blocked?'true':'false');}} if(!offer){{ if(estimate) estimate.textContent='Pricing unavailable'; syncSellerFields(null); return; }} if(estimate) estimate.textContent=money(offer.cents); if(hidden) hidden.value=offer.cents; document.querySelector('[data-review-device]').textContent=offer.row.brand+' '+offer.row.model; document.querySelector('[data-review-storage]').textContent=offer.row.storage; document.querySelector('[data-review-carrier]').textContent=fields.carrier.value; document.querySelector('[data-review-condition]').textContent=fields.condition.value; document.querySelector('[data-review-payout]').textContent=money(offer.cents); document.querySelector('[data-review-adjustments]').textContent=offer.adjustments.join('; '); document.querySelector('[data-adjustment-summary]').textContent=offer.adjustments.join('; '); syncSellerFields(offer); }}
         function refreshModels(){{ options(fields.model, unique(catalog.filter(r=>r.brand===fields.brand.value).map(r=>r.model))); refreshStorage(); }}
-        function refreshStorage(){{ options(fields.storage, unique(catalog.filter(r=>r.brand===fields.brand.value&&r.model===fields.model.value).map(r=>r.storage))); refreshEstimate(); }}
-        function refreshEstimate(){{ const row=catalog.find(r=>r.brand===fields.brand.value&&r.model===fields.model.value&&r.storage===fields.storage.value); const estimate=document.getElementById('estimate'); const hidden=document.getElementById('estimated_payout_cents'); if(!row){{estimate.textContent='Pricing unavailable'; return;}} let cents=row.maximum_payout_cents; if(fields.condition.value==='Good') cents=Math.max(0,row.base_value_cents-row.condition_deduction_cents); if(fields.condition.value==='Fair') cents=Math.max(0,row.base_value_cents-16000); if(fields.condition.value==='Damaged') cents=Math.max(0,row.base_value_cents-30000); if(fields.condition.value==='Not Working') cents=row.non_working_value_cents; hidden.value=cents; estimate.textContent='$'+(cents/100).toLocaleString(undefined,{{maximumFractionDigits:0}}); }}
-        options(fields.brand, unique(catalog.map(r=>r.brand))); options(fields.condition, conditions); ['brand','model','storage','condition'].forEach(id=>fields[id]&&fields[id].addEventListener('change', id==='brand'?refreshModels:id==='model'?refreshStorage:refreshEstimate)); refreshModels();
-        document.querySelector('.mobile-menu-toggle')?.addEventListener('click',()=>document.body.classList.toggle('nav-open'));
+        function refreshStorage(){{ options(fields.storage, unique(catalog.filter(r=>r.brand===fields.brand.value&&r.model===fields.model.value).map(r=>r.storage))); refreshQuoteReview(); }}
+        function setSelectedDevice(row){{ if(!row) return; fields.brand.value=row.brand; refreshModels(); fields.model.value=row.model; refreshStorage(); fields.storage.value=row.storage; refreshQuoteReview(); document.getElementById('quote')?.scrollIntoView({{behavior:'smooth',block:'start'}}); }}
+        function refreshCatalog(){{ const search=document.querySelector('[data-catalog-search]')?.value.toLowerCase()||''; const brand=document.querySelector('[data-catalog-brand]')?.value||''; const model=document.querySelector('[data-catalog-model]')?.value||''; const storage=document.querySelector('[data-catalog-storage]')?.value||''; const sort=document.querySelector('[data-catalog-sort]')?.value||'payout'; let rows=catalog.filter(row=>(!brand||row.brand===brand)&&(!model||row.model===model)&&(!storage||row.storage===storage)&&(`${{row.brand}} ${{row.model}} ${{row.storage}}`.toLowerCase().includes(search))); rows.sort((a,b)=>sort==='newest'?b.newest_rank-a.newest_rank:b.maximum_payout_cents-a.maximum_payout_cents); document.querySelectorAll('[data-catalog-card]').forEach(card=>card.hidden=true); rows.slice(0,visibleCount).forEach(row=>{{ const card=[...document.querySelectorAll('[data-catalog-card]')].find(el=>el.dataset.brand===row.brand&&el.dataset.model===row.model&&el.dataset.storage===row.storage); if(card) card.hidden=false; }}); document.querySelector('[data-catalog-empty]')?.toggleAttribute('hidden', rows.length!==0); const load=document.querySelector('[data-load-more]'); if(load) load.hidden=rows.length<=visibleCount; }}
+        options(fields.brand, unique(catalog.map(r=>r.brand))); options(fields.condition, conditions); ['brand','model','storage','carrier','condition'].forEach(id=>fields[id]&&fields[id].addEventListener('change', id==='brand'?refreshModels:id==='model'?refreshStorage:refreshQuoteReview));
+        const brandFilter=document.querySelector('[data-catalog-brand]'), modelFilter=document.querySelector('[data-catalog-model]'), storageFilter=document.querySelector('[data-catalog-storage]'); options(brandFilter, unique(catalog.map(r=>r.brand)), 'All brands'); options(modelFilter, unique(catalog.map(r=>r.model)), 'All models'); options(storageFilter, unique(catalog.map(r=>r.storage)), 'All storage'); document.querySelectorAll('[data-catalog-search],[data-catalog-brand],[data-catalog-model],[data-catalog-storage],[data-catalog-sort]').forEach(el=>el.addEventListener('input',()=>{{visibleCount=8;refreshCatalog();}})); document.querySelector('[data-load-more]')?.addEventListener('click',()=>{{visibleCount+=8;refreshCatalog();}}); document.querySelectorAll('.brand-card').forEach(btn=>btn.addEventListener('click',()=>{{ if(brandFilter) brandFilter.value=btn.dataset.brand||''; const row=catalog.find(r=>r.brand===btn.dataset.brand); setSelectedDevice(row); refreshCatalog(); }})); document.querySelectorAll('[data-get-quote]').forEach(btn=>btn.addEventListener('click',()=>{{ const card=btn.closest('[data-catalog-card]'); setSelectedDevice(catalog.find(r=>r.brand===card.dataset.brand&&r.model===card.dataset.model&&r.storage===card.dataset.storage)); }})); document.querySelectorAll('[data-question-key]').forEach(article=>article.querySelectorAll('[data-answer]').forEach(button=>button.addEventListener('click',()=>{{ questionnaireAnswers[article.dataset.questionKey]=button.dataset.answer; article.querySelectorAll('[data-answer]').forEach(other=>other.classList.toggle('selected',other===button)); refreshQuestionnaire(); }})));
+        function refreshQuestionnaire(){{ const answered=Object.values(questionnaireAnswers).filter(Boolean).length; document.querySelector('[data-question-progress]').style.width=Math.round((answered/questionKeys.length)*100)+'%'; document.querySelector('[data-question-count]').textContent=answered+' of '+questionKeys.length+' answered'; refreshQuoteReview(); }}
+        refreshModels(); refreshCatalog(); refreshQuestionnaire();
+        document.querySelector('.mobile-menu-toggle')?.addEventListener('click',event=>{{const open=document.body.classList.toggle('nav-open'); event.currentTarget.setAttribute('aria-expanded', open?'true':'false');}});
         """
 
     def _footer(self) -> str:
