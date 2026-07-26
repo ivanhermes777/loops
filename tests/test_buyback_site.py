@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import sqlite3
 import tempfile
 import unittest
 from urllib.parse import urlencode
@@ -489,6 +490,59 @@ class BuybackSiteTests(unittest.TestCase):
         self.assertIn("data-help-article", support)
         self.assertIn("data-help-empty", support)
         self.assertIn("filterHelpArticles", support)
+
+    def test_questionnaire_answers_have_visible_selected_state_and_aria_pressed(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+
+        status, _headers, home = client.get("/")
+
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("data-answer=\"yes\" aria-pressed=\"false\"", home)
+        self.assertIn(".question [data-answer].selected", home)
+        self.assertIn("linear-gradient(135deg,var(--purple),var(--blue))", home)
+        self.assertIn("setAttribute('aria-pressed',other===button?'true':'false')", home)
+
+    def test_mobile_hamburger_exposes_quote_and_sign_in_actions(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+
+        status, _headers, home = client.get("/")
+
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("@media(max-width:760px)", home)
+        self.assertIn(".nav-open .actions", home)
+        self.assertRegex(home, r"\.nav-open \.actions\{[^}]*display:flex")
+
+    def test_catalog_renders_all_seeded_cards_so_xiaomi_filter_has_a_card(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+
+        status, _headers, home = client.get("/")
+
+        self.assertTrue(status.startswith("200"))
+        self.assertEqual(home.count("class='phone-card' data-catalog-card"), len(self.store.list_pricing(active_only=True)))
+        self.assertIn("data-brand='Xiaomi'", home)
+        self.assertIn("Xiaomi 14 Ultra", home)
+
+    def test_existing_legacy_pricing_schema_is_recovered_before_seed_sample(self):
+        legacy_db = os.path.join(self.tempdir.name, "legacy-buyback.sqlite3")
+        with sqlite3.connect(legacy_db) as connection:
+            connection.execute(
+                "CREATE TABLE pricing (id INTEGER PRIMARY KEY AUTOINCREMENT, brand TEXT NOT NULL, model TEXT NOT NULL, storage TEXT NOT NULL, base_price_cents INTEGER NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO pricing (brand, model, storage, base_price_cents) VALUES ('Legacy', 'Phone', '64GB', 12345)"
+            )
+
+        store = BuybackStore(legacy_db)
+        seed_sample_data(store)
+
+        rows = store.list_pricing(active_only=True)
+        self.assertTrue(any(row["brand"] == "Apple iPhone" for row in rows))
+        legacy_row = next(row for row in rows if row["brand"] == "Legacy")
+        self.assertEqual(legacy_row["base_value_cents"], 12345)
+        self.assertEqual(legacy_row["maximum_payout_cents"], 12345)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,7 @@ class BuybackStore:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
+            self._recover_legacy_pricing_schema(connection)
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS pricing (
@@ -100,6 +101,77 @@ class BuybackStore:
                     payment_sent INTEGER NOT NULL DEFAULT 0
                 )
                 """
+            )
+
+    def _recover_legacy_pricing_schema(self, connection: sqlite3.Connection) -> None:
+        existing = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='pricing'"
+        ).fetchone()
+        if existing is None:
+            return
+
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(pricing)").fetchall()}
+        required = {
+            "brand", "model", "storage", "base_value_cents", "maximum_payout_cents",
+            "carrier_adjustment_cents", "condition_deduction_cents", "screen_damage_deduction_cents",
+            "back_glass_deduction_cents", "water_damage_deduction_cents", "non_working_value_cents",
+            "promotional_bonus_cents", "newest_rank", "active",
+        }
+        has_unique_device_index = False
+        for index in connection.execute("PRAGMA index_list(pricing)").fetchall():
+            if not index[2]:
+                continue
+            index_columns = [row[2] for row in connection.execute(f"PRAGMA index_info({index[1]})").fetchall()]
+            if index_columns == ["brand", "model", "storage"]:
+                has_unique_device_index = True
+                break
+        if required.issubset(columns) and has_unique_device_index:
+            return
+
+        legacy_rows = [dict(row) for row in connection.execute("SELECT * FROM pricing").fetchall()]
+        backup_name = f"pricing_legacy_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        connection.execute(f"ALTER TABLE pricing RENAME TO {backup_name}")
+        connection.execute(
+            """
+            CREATE TABLE pricing (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                brand TEXT NOT NULL,
+                model TEXT NOT NULL,
+                storage TEXT NOT NULL,
+                base_value_cents INTEGER NOT NULL CHECK(base_value_cents >= 0),
+                maximum_payout_cents INTEGER NOT NULL CHECK(maximum_payout_cents >= 0),
+                carrier_adjustment_cents INTEGER NOT NULL DEFAULT 0,
+                condition_deduction_cents INTEGER NOT NULL DEFAULT 0,
+                screen_damage_deduction_cents INTEGER NOT NULL DEFAULT 0,
+                back_glass_deduction_cents INTEGER NOT NULL DEFAULT 0,
+                water_damage_deduction_cents INTEGER NOT NULL DEFAULT 0,
+                non_working_value_cents INTEGER NOT NULL DEFAULT 0,
+                promotional_bonus_cents INTEGER NOT NULL DEFAULT 0,
+                newest_rank INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(brand, model, storage)
+            )
+            """
+        )
+        for row in legacy_rows:
+            base_value = int(row.get("base_value_cents") or row.get("base_price_cents") or 0)
+            active_value = row.get("active")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO pricing (brand, model, storage, base_value_cents, maximum_payout_cents,
+                    carrier_adjustment_cents, condition_deduction_cents, screen_damage_deduction_cents,
+                    back_glass_deduction_cents, water_damage_deduction_cents, non_working_value_cents,
+                    promotional_bonus_cents, newest_rank, active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row.get("brand", "Legacy Brand"), row.get("model", "Legacy Device"), row.get("storage", "Unknown"),
+                    base_value, int(row.get("maximum_payout_cents") or base_value), int(row.get("carrier_adjustment_cents") or 0),
+                    int(row.get("condition_deduction_cents") or 0), int(row.get("screen_damage_deduction_cents") or 0),
+                    int(row.get("back_glass_deduction_cents") or 0), int(row.get("water_damage_deduction_cents") or 0),
+                    int(row.get("non_working_value_cents") or 0), int(row.get("promotional_bonus_cents") or 0),
+                    int(row.get("newest_rank") or 0), int(active_value) if active_value is not None else 1,
+                ),
             )
 
     def upsert_pricing(self, **row: Any) -> None:
