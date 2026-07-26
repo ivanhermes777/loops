@@ -8,6 +8,7 @@ import hmac
 import html
 import json
 import os
+import subprocess
 from http import HTTPStatus
 from pathlib import Path
 from typing import Callable
@@ -38,6 +39,11 @@ class BuybackApp:
                 return self._send(start_response, HTTPStatus.OK, self._public_quote_page())
             if method == "POST" and path == "/request":
                 status, body = self._submit_request(self._form_data(environ))
+                return self._send(start_response, status, body)
+            if method == "GET" and path == "/prompt-builder":
+                return self._send(start_response, HTTPStatus.OK, self._prompt_builder_page())
+            if method == "POST" and path == "/prompt-builder":
+                status, body = self._submit_prompt_builder(self._form_data(environ))
                 return self._send(start_response, status, body)
             if method == "GET" and path == "/admin/login":
                 return self._send(start_response, HTTPStatus.OK, self._login_page())
@@ -208,6 +214,113 @@ class BuybackApp:
             """,
         )
 
+    def _prompt_builder_page(
+        self,
+        *,
+        validation_message: str = "",
+        unavailable: bool = False,
+        improved_prompt: str = "",
+    ) -> str:
+        validation_html = (
+            f"<p class='prompt-validation' role='alert'>{html.escape(validation_message)}</p>"
+            if validation_message
+            else ""
+        )
+        unavailable_html = (
+            """
+            <div class="prompt-error" role="alert">
+              <strong>Prompt improvement is temporarily unavailable.</strong>
+              <span>Please try again shortly. Your prompt was not stored.</span>
+            </div>
+            """
+            if unavailable
+            else ""
+        )
+        result_html = (
+            f"<pre id='improved-prompt-text' class='prompt-output-text'>{html.escape(improved_prompt)}</pre>"
+            if improved_prompt
+            else "<p id='improved-prompt-text' class='prompt-placeholder'>Your optimized prompt will appear here after generation.</p>"
+        )
+        body = f"""
+        <section class="prompt-shell">
+          <header class="prompt-topbar" aria-label="Zelvari prompt builder header">
+            <a class="prompt-brand" href="/prompt-builder" aria-label="Zelvari prompt builder home"><span class="prompt-logo">Z</span><span>ZELVARI</span></a>
+            <a class="prompt-home" href="/">Cellphone Buyback</a>
+          </header>
+          <section class="prompt-hero">
+            <div class="prompt-orb" aria-hidden="true"><span>Z</span></div>
+            <div>
+              <h1>Write Better Prompts. <span>Get Better Results.</span></h1>
+              <p>Enter your prompt and let AI optimize it for clarity, power, and results.</p>
+              <div class="prompt-badges" aria-label="Prompt builder features">
+                <span>⚡ AI-Powered</span>
+                <span>📈 Smart Optimization</span>
+                <span>🎯 Stronger Results</span>
+              </div>
+            </div>
+          </section>
+          <section class="prompt-flow" aria-label="Prompt improvement workflow">
+            <form class="prompt-card prompt-input-card" method="post" action="/prompt-builder" novalidate>
+              <div class="prompt-card-title"><span>↗</span><h2>Your Prompt</h2><button type="button" class="prompt-clear" id="prompt-clear">Clear</button></div>
+              {validation_html}
+              <label class="prompt-textarea-label" for="prompt-input">Rough prompt</label>
+              <textarea id="prompt-input" name="prompt" maxlength="4000" placeholder="Paste or type your prompt here..." aria-describedby="prompt-counter prompt-privacy"></textarea>
+              <div class="prompt-counter" id="prompt-counter">0 / 4000</div>
+              <div class="prompt-select-grid">
+                <label>Goal<select name="goal">{_prompt_options(['General', 'Marketing', 'Sales', 'Content', 'Coding'])}</select></label>
+                <label>Tone<select name="tone">{_prompt_options(['Professional', 'Friendly', 'Bold', 'Luxury', 'Concise'])}</select></label>
+                <label>Platform<select name="platform">{_prompt_options(['General (Any AI)', 'Website', 'Social Media', 'Email', 'Hermes/Codex'])}</select></label>
+              </div>
+              <button class="prompt-submit" type="submit">✧ Improve Prompt</button>
+            </form>
+            <div class="prompt-arrow" aria-hidden="true">»</div>
+            <article class="prompt-card prompt-output-card" aria-live="polite">
+              <div class="prompt-card-title"><span>✣</span><h2>Improved Prompt</h2><button type="button" class="prompt-copy" id="copy-prompt">Copy</button></div>
+              {unavailable_html}
+              <div class="prompt-output-box">{result_html}</div>
+              <p class="prompt-copy-status" id="copy-status" aria-live="polite"></p>
+            </article>
+          </section>
+          <p class="prompt-privacy" id="prompt-privacy">⌾ Your prompts are private and never stored.</p>
+        </section>
+        <script>
+        const promptInput = document.getElementById('prompt-input');
+        const promptCounter = document.getElementById('prompt-counter');
+        const clearButton = document.getElementById('prompt-clear');
+        const copyButton = document.getElementById('copy-prompt');
+        const copyStatus = document.getElementById('copy-status');
+        function updatePromptCounter() {{ promptCounter.textContent = `${{promptInput.value.length}} / 4000`; }}
+        promptInput.addEventListener('input', updatePromptCounter);
+        clearButton.addEventListener('click', () => {{ promptInput.value = ''; updatePromptCounter(); promptInput.focus(); }});
+        copyButton.addEventListener('click', async () => {{
+          const text = document.getElementById('improved-prompt-text').innerText.trim();
+          if (!text || text === 'Your optimized prompt will appear here after generation.') return;
+          try {{ await navigator.clipboard.writeText(text); copyStatus.textContent = 'Copied'; }}
+          catch (error) {{ copyStatus.textContent = 'Select the prompt text to copy manually.'; }}
+        }});
+        updatePromptCounter();
+        </script>
+        """
+        return self._page("Zelvari AI Prompt Builder", body, prompt_builder=True)
+
+    def _submit_prompt_builder(self, data: dict[str, str]) -> tuple[HTTPStatus, str]:
+        prompt = data.get("prompt", "").strip()
+        if not prompt:
+            return HTTPStatus.BAD_REQUEST, self._prompt_builder_page(validation_message="Please enter a prompt to improve.")
+        if len(prompt) > 4000:
+            prompt = prompt[:4000]
+        improved_prompt = _run_prompt_builder_command(
+            {
+                "prompt": prompt,
+                "goal": data.get("goal", "General").strip() or "General",
+                "tone": data.get("tone", "Professional").strip() or "Professional",
+                "platform": data.get("platform", "General (Any AI)").strip() or "General (Any AI)",
+            }
+        )
+        if improved_prompt is None:
+            return HTTPStatus.SERVICE_UNAVAILABLE, self._prompt_builder_page(unavailable=True)
+        return HTTPStatus.OK, self._prompt_builder_page(improved_prompt=improved_prompt)
+
     def _login_page(self, message: str = "") -> str:
         notice = f"<p class='error'>{html.escape(message)}</p>" if message else ""
         return self._page(
@@ -320,7 +433,8 @@ class BuybackApp:
         items = "".join(f"<li>{html.escape(error)}</li>" for error in errors)
         return f"<ul class='error'>{items}</ul>"
 
-    def _page(self, title: str, body: str) -> str:
+    def _page(self, title: str, body: str, *, prompt_builder: bool = False) -> str:
+        body_class = "prompt-builder-page" if prompt_builder else ""
         return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -352,15 +466,89 @@ class BuybackApp:
     .inline-form input[type='number'] {{ max-width:150px; }}
     .checkbox {{ flex-direction:row; align-items:center; font-weight:600; }}
     .checkbox input {{ width:auto; }}
+    body.prompt-builder-page {{ padding:0; background:#030712; overflow-x:hidden; }}
+    body.prompt-builder-page::before {{ content:""; position:fixed; inset:0; pointer-events:none; background:radial-gradient(circle at 18% 21%, rgba(68, 29, 237, .35), transparent 18rem), radial-gradient(circle at 84% 35%, rgba(14, 165, 233, .20), transparent 25rem), linear-gradient(120deg, rgba(124,58,237,.10), transparent 35%, rgba(6,182,212,.10)); }}
+    .prompt-shell {{ position:relative; max-width:1480px; min-height:100vh; margin:0 auto; padding:26px clamp(16px, 4vw, 56px) 36px; }}
+    .prompt-topbar {{ display:flex; justify-content:space-between; align-items:center; gap:16px; padding-bottom:24px; border-bottom:1px solid rgba(148,163,184,.12); }}
+    .prompt-brand, .prompt-home {{ color:#fff; text-decoration:none; }}
+    .prompt-brand {{ display:flex; align-items:center; gap:16px; font-size:1.7rem; font-weight:900; letter-spacing:.22em; }}
+    .prompt-logo {{ display:grid; place-items:center; width:42px; height:42px; border-radius:12px; background:linear-gradient(135deg, #06b6d4, #7c3aed 55%, #e879f9); box-shadow:0 0 28px rgba(124,58,237,.8); letter-spacing:0; }}
+    .prompt-home {{ border:1px solid rgba(99,102,241,.35); border-radius:999px; color:#c4b5fd; padding:10px 14px; background:rgba(15,23,42,.72); }}
+    .prompt-hero {{ display:grid; grid-template-columns:220px minmax(0, 1fr); align-items:center; gap:44px; margin:44px auto 30px; max-width:1120px; }}
+    .prompt-orb {{ width:180px; height:180px; display:grid; place-items:center; border-radius:999px; background:radial-gradient(circle, rgba(99,102,241,.55), rgba(2,6,23,.15) 52%, transparent 53%), conic-gradient(from 90deg, #22d3ee, #7c3aed, #d946ef, #22d3ee); box-shadow:0 0 54px rgba(79,70,229,.8); padding:3px; }}
+    .prompt-orb span {{ display:grid; place-items:center; width:100%; height:100%; border-radius:inherit; background:#050816; color:#c4b5fd; font-size:5rem; font-weight:900; text-shadow:0 0 24px #8b5cf6; }}
+    .prompt-hero h1 {{ margin:0; font-size:clamp(2.2rem, 5vw, 4.3rem); line-height:1.06; text-align:center; }}
+    .prompt-hero h1 span {{ color:#b084ff; text-shadow:0 0 22px rgba(168,85,247,.48); }}
+    .prompt-hero p {{ color:#dbeafe; text-align:center; font-size:1.25rem; margin:16px 0 24px; }}
+    .prompt-badges {{ display:flex; justify-content:center; gap:14px; flex-wrap:wrap; }}
+    .prompt-badges span {{ border:1px solid rgba(99,102,241,.32); background:linear-gradient(180deg, rgba(15,23,42,.92), rgba(15,23,42,.56)); border-radius:999px; padding:13px 24px; color:#eef2ff; box-shadow:inset 0 1px rgba(255,255,255,.08); }}
+    .prompt-flow {{ position:relative; display:grid; grid-template-columns:minmax(0, 1fr) 74px minmax(0, 1fr); gap:28px; align-items:center; }}
+    .prompt-card {{ border:1px solid rgba(139,92,246,.72); background:linear-gradient(180deg, rgba(15,23,42,.94), rgba(2,6,23,.90)); box-shadow:0 0 44px rgba(79,70,229,.25), inset 0 1px rgba(255,255,255,.05); border-radius:22px; padding:24px; min-height:520px; }}
+    .prompt-output-card {{ border-color:rgba(168,85,247,.82); }}
+    .prompt-card-title {{ display:flex; align-items:center; gap:12px; margin-bottom:14px; }}
+    .prompt-card-title h2 {{ margin:0; text-transform:uppercase; font-size:1rem; letter-spacing:.04em; }}
+    .prompt-card-title span {{ color:#d946ef; font-size:1.35rem; }}
+    .prompt-card-title button {{ margin-left:auto; border:1px solid rgba(148,163,184,.22); background:rgba(15,23,42,.74); color:#dbeafe; border-radius:12px; padding:10px 14px; }}
+    .prompt-textarea-label {{ position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }}
+    #prompt-input, .prompt-output-box {{ min-height:265px; border:1px solid rgba(71,85,105,.85); background:rgba(2,6,23,.72); border-radius:16px; color:#f8fafc; }}
+    #prompt-input {{ padding:18px; font-size:1.08rem; resize:vertical; }}
+    .prompt-counter {{ margin:-36px 16px 30px auto; width:max-content; color:#a5b4fc; position:relative; }}
+    .prompt-select-grid {{ display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:14px; margin:0 0 24px; }}
+    .prompt-select-grid label {{ font-weight:600; color:#e2e8f0; }}
+    .prompt-select-grid select {{ background:#0f172a; border-color:rgba(99,102,241,.42); }}
+    .prompt-submit {{ width:100%; border-radius:12px; padding:18px 22px; font-size:1.12rem; background:linear-gradient(135deg, #6d28d9, #2563eb 65%, #0ea5e9); box-shadow:0 0 30px rgba(37,99,235,.48); }}
+    .prompt-arrow {{ display:grid; place-items:center; width:72px; height:72px; margin:auto; border-radius:999px; color:#c4b5fd; font-size:3rem; background:radial-gradient(circle, rgba(91,33,182,.92), rgba(49,46,129,.75)); border:2px solid #8b5cf6; box-shadow:0 0 34px rgba(139,92,246,.86); }}
+    .prompt-output-box {{ padding:20px; }}
+    .prompt-output-text {{ margin:0; white-space:pre-wrap; word-break:break-word; font:inherit; line-height:1.58; color:#f8fafc; }}
+    .prompt-placeholder {{ color:#94a3b8; margin:0; }}
+    .prompt-error, .prompt-validation {{ border:1px solid rgba(248,113,113,.45); background:rgba(127,29,29,.30); color:#fecaca; border-radius:14px; padding:13px 15px; }}
+    .prompt-error {{ display:flex; flex-direction:column; gap:4px; margin-bottom:14px; }}
+    .prompt-copy-status, .prompt-privacy {{ color:#a5b4fc; text-align:center; }}
+    .prompt-privacy {{ margin:28px 0 0; }}
     @media (max-width:720px) {{ body {{ padding:14px; }} .hero, .card {{ padding:20px; border-radius:22px; }} .grid {{ grid-template-columns:1fr; }} table {{ display:block; overflow-x:auto; white-space:nowrap; }} }}
+    @media (max-width:900px) {{ body.prompt-builder-page {{ padding:0; }} .prompt-topbar {{ align-items:flex-start; }} .prompt-brand {{ font-size:1.25rem; }} .prompt-hero {{ grid-template-columns:1fr; text-align:center; gap:20px; }} .prompt-orb {{ margin:auto; width:132px; height:132px; }} .prompt-flow {{ grid-template-columns:1fr; }} .prompt-arrow {{ transform:rotate(90deg); }} .prompt-card {{ min-height:auto; }} .prompt-select-grid {{ grid-template-columns:1fr; }} }}
   </style>
 </head>
-<body><main>{body}</main></body>
+<body class="{body_class}"><main>{body}</main></body>
 </html>"""
 
 
 def _money(cents: int) -> str:
     return f"${cents / 100:,.2f}"
+
+
+def _prompt_options(options: list[str]) -> str:
+    return "".join(
+        f"<option value=\"{html.escape(option)}\">{html.escape(option)}</option>"
+        for option in options
+    )
+
+
+def _run_prompt_builder_command(payload: dict[str, str]) -> str | None:
+    command_json = os.environ.get("PROMPT_BUILDER_COMMAND_JSON", "").strip()
+    if not command_json:
+        return None
+    try:
+        command = json.loads(command_json)
+        if not isinstance(command, list) or not command or not all(isinstance(part, str) and part for part in command):
+            return None
+        timeout = int(os.environ.get("PROMPT_BUILDER_TIMEOUT_SECONDS", "20"))
+        completed = subprocess.run(
+            command,
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            timeout=max(1, min(timeout, 60)),
+            check=False,
+        )
+    except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if completed.returncode != 0:
+        return None
+    improved_prompt = completed.stdout.strip()
+    if not improved_prompt:
+        return None
+    return improved_prompt[:12000]
 
 
 def create_app(db_path: str | None = None) -> BuybackApp:

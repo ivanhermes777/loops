@@ -1,5 +1,6 @@
 import io
 import os
+import sys
 import tempfile
 import unittest
 from urllib.parse import urlencode
@@ -218,6 +219,126 @@ class BuybackSiteTests(unittest.TestCase):
         self.assertTrue(status.startswith("200"))
         self.assertIn("Pricing is not available yet", body)
         self.assertNotIn("<select", body)
+
+    def test_prompt_builder_get_shows_required_public_ui(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+
+        status, _headers, body = client.get("/prompt-builder")
+
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("Write Better Prompts", body)
+        self.assertIn("name=\"prompt\"", body)
+        self.assertIn("maxlength=\"4000\"", body)
+        self.assertIn("0 / 4000", body)
+        self.assertIn("Goal", body)
+        self.assertIn("name=\"goal\"", body)
+        self.assertIn("Tone", body)
+        self.assertIn("name=\"tone\"", body)
+        self.assertIn("Platform", body)
+        self.assertIn("name=\"platform\"", body)
+        self.assertIn("Improve Prompt", body)
+        self.assertIn("Improved Prompt", body)
+        self.assertIn("Copy", body)
+        self.assertIn("Your prompts are private and never stored", body)
+
+    def test_empty_prompt_submission_validates_inline_without_running_command(self):
+        os.environ["PROMPT_BUILDER_COMMAND_JSON"] = '["/definitely/not/run"]'
+        self.addCleanup(os.environ.pop, "PROMPT_BUILDER_COMMAND_JSON", None)
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+
+        status, _headers, body = client.post(
+            "/prompt-builder",
+            {"prompt": "   ", "goal": "general", "tone": "professional", "platform": "any"},
+        )
+
+        self.assertTrue(status.startswith("400"))
+        self.assertIn("Please enter a prompt to improve.", body)
+        self.assertIn("Write Better Prompts", body)
+
+    def test_valid_prompt_submission_renders_improved_prompt_only_and_does_not_store_prompt_text(self):
+        stub = (
+            "import sys; "
+            "sys.stdin.read(); "
+            "print('Improved safe prompt with clear objectives and a strong CTA.')"
+        )
+        os.environ["PROMPT_BUILDER_COMMAND_JSON"] = json_command([sys.executable, "-c", stub])
+        self.addCleanup(os.environ.pop, "PROMPT_BUILDER_COMMAND_JSON", None)
+        raw_prompt = "rough <script>alert('x')</script> landing page prompt"
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+
+        status, _headers, body = client.post(
+            "/prompt-builder",
+            {
+                "prompt": raw_prompt,
+                "goal": "marketing",
+                "tone": "professional",
+                "platform": "website",
+            },
+        )
+
+        self.assertTrue(status.startswith("200"))
+        self.assertIn("Improved safe prompt with clear objectives and a strong CTA.", body)
+        self.assertIn("Copy", body)
+        self.assertNotIn("Token", body)
+        self.assertNotIn("Model", body)
+        self.assertNotIn("Prompt Score", body)
+        self.assertNotIn(raw_prompt, body)
+        self.assertEqual(self.store.list_offer_requests(), [])
+
+    def test_failing_prompt_command_shows_sanitized_temporary_unavailable_error(self):
+        secret = "super-secret-command-token"
+        os.environ["PROMPT_BUILDER_COMMAND_JSON"] = json_command(
+            [sys.executable, "-c", f"import sys; sys.stderr.write('{secret}'); raise SystemExit(2)"]
+        )
+        self.addCleanup(os.environ.pop, "PROMPT_BUILDER_COMMAND_JSON", None)
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+
+        status, _headers, body = client.post(
+            "/prompt-builder",
+            {"prompt": "Make this better", "goal": "general", "tone": "professional", "platform": "any"},
+        )
+
+        self.assertTrue(status.startswith("503"))
+        self.assertIn("Prompt improvement is temporarily unavailable", body)
+        self.assertNotIn(secret, body)
+        self.assertNotIn("Traceback", body)
+        self.assertNotIn("PROMPT_BUILDER_COMMAND_JSON", body)
+
+    def test_prompt_builder_text_is_not_exposed_in_buyback_admin(self):
+        stub = "import sys; sys.stdin.read(); print('Private improved prompt output')"
+        os.environ["PROMPT_BUILDER_COMMAND_JSON"] = json_command([sys.executable, "-c", stub])
+        os.environ["BUYBACK_ADMIN_USERNAME"] = "michael"
+        os.environ["BUYBACK_ADMIN_PASSWORD"] = "safe-password"
+        self.addCleanup(os.environ.pop, "PROMPT_BUILDER_COMMAND_JSON", None)
+        self.addCleanup(os.environ.pop, "BUYBACK_ADMIN_USERNAME", None)
+        self.addCleanup(os.environ.pop, "BUYBACK_ADMIN_PASSWORD", None)
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+
+        prompt_status, _prompt_headers, _prompt_body = client.post(
+            "/prompt-builder",
+            {"prompt": "Private raw prompt", "goal": "general", "tone": "professional", "platform": "any"},
+        )
+        login_status, _headers, admin_body = client.post(
+            "/admin/login",
+            {"username": "michael", "password": "safe-password"},
+        )
+
+        self.assertTrue(prompt_status.startswith("200"))
+        self.assertTrue(login_status.startswith("200"))
+        self.assertEqual(self.store.list_offer_requests(), [])
+        self.assertNotIn("Private raw prompt", admin_body)
+        self.assertNotIn("Private improved prompt output", admin_body)
+
+
+def json_command(command):
+    import json
+
+    return json.dumps(command)
 
 
 if __name__ == "__main__":

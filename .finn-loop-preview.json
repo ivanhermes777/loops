@@ -9,5 +9,5 @@
     "{port}",
     "--seed-sample"
   ],
-  "path": "/"
+  "path": "/prompt-builder"
 }
