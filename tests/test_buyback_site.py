@@ -453,6 +453,114 @@ class BuybackSiteTests(unittest.TestCase):
         self.assertEqual(saved["status"], "Payment Sent")
         self.assertEqual(saved["final_payout_cents"], 65000)
 
+    def test_admin_pricing_update_edits_all_quote_adjustment_fields_and_recalculates_offers(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+        os.environ["BUYBACK_ADMIN_USERNAME"] = "michael"
+        os.environ["BUYBACK_ADMIN_PASSWORD"] = "safe-password"
+        self.addCleanup(os.environ.pop, "BUYBACK_ADMIN_USERNAME", None)
+        self.addCleanup(os.environ.pop, "BUYBACK_ADMIN_PASSWORD", None)
+        first_price = self.store.list_pricing()[0]
+
+        login_status, _headers, admin = client.post("/admin/login", {"username": "michael", "password": "safe-password"})
+
+        self.assertTrue(login_status.startswith("200"))
+        for field_name in [
+            "carrier_adjustment_cents",
+            "condition_deduction_cents",
+            "screen_damage_deduction_cents",
+            "back_glass_deduction_cents",
+            "water_damage_deduction_cents",
+            "non_working_value_cents",
+            "promotional_bonus_cents",
+        ]:
+            self.assertIn(f"name='{field_name}'", admin)
+
+        update_status, _headers, _body = client.post(
+            "/admin/pricing/update",
+            {
+                "id": str(first_price["id"]),
+                "base_value_cents": "50000",
+                "maximum_payout_cents": "100000",
+                "carrier_adjustment_cents": "1000",
+                "condition_deduction_cents": "2000",
+                "screen_damage_deduction_cents": "3000",
+                "back_glass_deduction_cents": "4000",
+                "water_damage_deduction_cents": "5000",
+                "non_working_value_cents": "6000",
+                "promotional_bonus_cents": "7000",
+                "active": "1",
+            },
+        )
+
+        self.assertTrue(update_status.startswith("200"))
+        updated = self.store.get_pricing_by_id(first_price["id"])
+        self.assertIsNotNone(updated)
+        if updated is None:
+            self.fail("updated pricing row was not found")
+        for field_name, expected in {
+            "base_value_cents": 50000,
+            "maximum_payout_cents": 100000,
+            "carrier_adjustment_cents": 1000,
+            "condition_deduction_cents": 2000,
+            "screen_damage_deduction_cents": 3000,
+            "back_glass_deduction_cents": 4000,
+            "water_damage_deduction_cents": 5000,
+            "non_working_value_cents": 6000,
+            "promotional_bonus_cents": 7000,
+        }.items():
+            self.assertEqual(updated[field_name], expected)
+        recalculated = calculate_offer(
+            self.store,
+            brand=updated["brand"],
+            model=updated["model"],
+            storage=updated["storage"],
+            carrier="Unlocked",
+            condition="Good",
+            cracked_screen="yes",
+            cracked_back_glass="yes",
+            water_damage="yes",
+        )
+        self.assertEqual(recalculated["offer_cents"], 44000)
+        self.assertIn("Promotional bonus +$70.00", recalculated["adjustment_summary"])
+
+    def test_invalid_admin_pricing_values_return_clear_validation_and_preserve_row(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+        os.environ["BUYBACK_ADMIN_USERNAME"] = "michael"
+        os.environ["BUYBACK_ADMIN_PASSWORD"] = "safe-password"
+        self.addCleanup(os.environ.pop, "BUYBACK_ADMIN_USERNAME", None)
+        self.addCleanup(os.environ.pop, "BUYBACK_ADMIN_PASSWORD", None)
+        first_price = self.store.list_pricing()[0]
+        original_row = self.store.get_pricing_by_id(first_price["id"])
+        client.post("/admin/login", {"username": "michael", "password": "safe-password"})
+
+        for field_name, invalid_value in [("base_value_cents", "-1"), ("carrier_adjustment_cents", "not-a-number")]:
+            with self.subTest(field_name=field_name):
+                payload = {key: str(first_price[key]) for key in [
+                    "base_value_cents",
+                    "maximum_payout_cents",
+                    "carrier_adjustment_cents",
+                    "condition_deduction_cents",
+                    "screen_damage_deduction_cents",
+                    "back_glass_deduction_cents",
+                    "water_damage_deduction_cents",
+                    "non_working_value_cents",
+                    "promotional_bonus_cents",
+                ]}
+                payload.update({"id": str(first_price["id"]), field_name: invalid_value, "active": "1"})
+
+                status, _headers, body = client.post("/admin/pricing/update", payload)
+
+                self.assertTrue(status.startswith("400"), body)
+                self.assertIn("Pricing update failed", body)
+                self.assertIn(field_name.replace("_", " "), body)
+                self.assertNotIn("IntegrityError", body)
+                self.assertNotIn("Traceback", body)
+                self.assertNotIn("SQL", body)
+                self.assertNotIn("Something went wrong", body)
+                self.assertEqual(self.store.get_pricing_by_id(first_price["id"]), original_row)
+
     def test_demo_auth_flows_validate_but_do_not_store_customer_credentials(self):
         app = create_app(self.db_path)
         client = WsgiTestClient(app)

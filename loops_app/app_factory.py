@@ -8,6 +8,7 @@ import hmac
 import html
 import json
 import os
+import sqlite3
 from http import HTTPStatus
 from pathlib import Path
 from typing import Callable
@@ -30,6 +31,17 @@ StartResponse = Callable[[str, list[tuple[str, str]]], None]
 
 BRANDS = ["Apple iPhone", "Samsung Galaxy", "Google Pixel", "OnePlus", "Motorola", "Xiaomi", "Nothing", "Other Brands"]
 TIMELINE = ["Quote Created", "Shipping Label Sent", "Device Shipped", "Device Received", "Inspection Started", "Offer Confirmed", "Payment Sent"]
+PRICING_CENTS_FIELDS = [
+    ("base_value_cents", "Base value"),
+    ("maximum_payout_cents", "Maximum payout"),
+    ("carrier_adjustment_cents", "Carrier adjustment"),
+    ("condition_deduction_cents", "Condition deduction"),
+    ("screen_damage_deduction_cents", "Screen damage deduction"),
+    ("back_glass_deduction_cents", "Back glass deduction"),
+    ("water_damage_deduction_cents", "Water damage deduction"),
+    ("non_working_value_cents", "Non-working value"),
+    ("promotional_bonus_cents", "Promotional bonus"),
+]
 QUESTIONNAIRE = [
     ("power_on", "Does the device power on?"),
     ("cracked_screen", "Is the screen cracked?"),
@@ -293,7 +305,7 @@ class BuybackApp:
         stat_html = "".join(f"<article><strong>{label}</strong><span>{value}</span></article>" for label, value in [
             ("Total Quotes", stats["total_quotes"]), ("Accepted Quotes", stats["accepted_quotes"]), ("Devices Received", stats["devices_received"]), ("Devices Inspected", stats["devices_inspected"]), ("Payments Sent", stats["payments_sent"]), ("Average Payout", _money(stats["average_payout_cents"])), ("Conversion Rate", f"{stats['conversion_rate']}%"), ("Total Buyback Value", _money(stats["total_buyback_value_cents"])),
         ])
-        pricing_rows = "".join(f"<tr><td>{html.escape(row['brand'])}</td><td>{html.escape(row['model'])}</td><td>{html.escape(row['storage'])}</td><td>{_money(row['maximum_payout_cents'])}</td><td><form method='post' action='/admin/pricing/update'><input type='hidden' name='id' value='{row['id']}'><input name='base_value_cents' type='number' value='{row['base_value_cents']}'><input name='maximum_payout_cents' type='number' value='{row['maximum_payout_cents']}'><label><input type='checkbox' name='active' value='1' {'checked' if row['active'] else ''}> Active</label><button>Save</button></form></td></tr>" for row in self.store.list_pricing()) or "<tr><td colspan='5'>No pricing records yet.</td></tr>"
+        pricing_rows = "".join(self._pricing_row(row) for row in self.store.list_pricing()) or "<tr><td colspan='5'>No pricing records yet.</td></tr>"
         orders = self.store.list_orders()
         if customer_query:
             orders = [row for row in orders if customer_query in " ".join([row.get("full_name", ""), row.get("email", ""), row.get("phone", "")]).lower()]
@@ -306,12 +318,44 @@ class BuybackApp:
         quote_value = html.escape(filters.get("quote_number", ""))
         return self._page("Buyback Admin", f"<section class='glass admin'><h1>Admin Dashboard</h1>{self._error_list(errors or [])}<div class='stats'>{stat_html}</div><h2>Quotes</h2><form method='get' action='/admin' class='catalog-tools'><label>Search customers<input name='customer' placeholder='search customers' value='{customer_value}'></label><label>Search by quote number<input name='quote_number' placeholder='search by quote number' value='{quote_value}'></label><button class='btn primary'>Search</button><a class='btn ghost' href='/admin'>Reset</a></form><table>{order_rows}</table><h2>Editable Pricing Rows</h2><table>{pricing_rows}</table><h2>Management Areas</h2><div class='cards'><article><h3>Phone brands/models</h3><p>Seeded/admin-visible content.</p></article><article><h3>Reviews</h3><p>Seeded mock reviews.</p></article><article><h3>FAQs</h3><p>Seeded support FAQs.</p></article></div></section>")
 
+    def _pricing_row(self, row: dict) -> str:
+        inputs = "".join(
+            f"<label>{html.escape(label)}<input name='{html.escape(field)}' type='number' min='0' step='1' value='{int(row[field])}'></label>"
+            for field, label in PRICING_CENTS_FIELDS
+        )
+        return (
+            f"<tr><td>{html.escape(row['brand'])}</td><td>{html.escape(row['model'])}</td><td>{html.escape(row['storage'])}</td>"
+            f"<td>{_money(row['maximum_payout_cents'])}</td><td><form method='post' action='/admin/pricing/update'>"
+            f"<input type='hidden' name='id' value='{int(row['id'])}'>{inputs}"
+            f"<label><input type='checkbox' name='active' value='1' {'checked' if row['active'] else ''}> Active</label><button>Save</button></form></td></tr>"
+        )
+
     def _update_pricing(self, data: dict[str, str]) -> tuple[HTTPStatus, str]:
         try:
-            self.store.update_pricing(int(data["id"]), base_value_cents=int(data["base_value_cents"]), maximum_payout_cents=int(data.get("maximum_payout_cents") or data["base_value_cents"]), active=data.get("active") == "1")
-        except (KeyError, ValueError):
-            return HTTPStatus.BAD_REQUEST, self._admin_page(["Pricing update failed. Enter valid positive cents."])
+            pricing_id = self._parse_pricing_int(data, "id")
+            existing = self.store.get_pricing_by_id(pricing_id)
+            if existing is None:
+                raise ValueError("pricing row not found")
+            updates = {
+                field: self._parse_pricing_int(data, field) if field in data else int(existing[field])
+                for field, _label in PRICING_CENTS_FIELDS
+            }
+            updates["active"] = data.get("active") == "1"
+            self.store.update_pricing(pricing_id, **updates)
+        except (KeyError, ValueError, sqlite3.IntegrityError) as error:
+            return HTTPStatus.BAD_REQUEST, self._admin_page([f"Pricing update failed. {html.escape(str(error))}"])
         return HTTPStatus.OK, self._admin_page()
+
+    def _parse_pricing_int(self, data: dict[str, str], field: str) -> int:
+        try:
+            value = int(data[field])
+        except KeyError as error:
+            raise KeyError(f"{field.replace('_', ' ')} is required") from error
+        except ValueError as error:
+            raise ValueError(f"{field.replace('_', ' ')} must be a whole number of cents") from error
+        if value < 0:
+            raise ValueError(f"{field.replace('_', ' ')} must be 0 or greater")
+        return value
 
     def _update_order(self, data: dict[str, str]) -> tuple[HTTPStatus, str]:
         try:
