@@ -4,6 +4,8 @@ import re
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
+from unittest import mock
 from urllib.parse import urlencode
 
 from loops_app.app_factory import create_app
@@ -152,10 +154,14 @@ class BuybackSiteTests(unittest.TestCase):
 
         self.assertTrue(status.startswith("200"))
         self.assertIn("Zelvari will follow up manually", body)
-        self.assertRegex(body, r"ZEL-[0-9]{6}-[0-9A-F]{4}")
+        self.assertRegex(body, r"ZEL-[0-9]{6}-[0-9A-F]{16}")
         orders = self.store.list_orders()
         self.assertEqual(len(orders), 1)
-        self.assertEqual(orders[0]["quote_number"], re.search(r"ZEL-[0-9]{6}-[0-9A-F]{4}", body).group(0))
+        quote_match = re.search(r"ZEL-[0-9]{6}-[0-9A-F]{16}", body)
+        self.assertIsNotNone(quote_match)
+        if quote_match is None:
+            self.fail("confirmation page did not include a high-entropy quote number")
+        self.assertEqual(orders[0]["quote_number"], quote_match.group(0))
         self.assertEqual(orders[0]["payout_method"], "PayPal")
 
     def test_public_pages_include_premium_branding_catalog_support_demo_auth_dashboard_empty_states(self):
@@ -237,10 +243,145 @@ class BuybackSiteTests(unittest.TestCase):
         self.assertIn("Pricing is not available yet", body)
         self.assertIn("No catalog matches", body)
 
-        lookup_status, _headers, lookup = client.post("/support/lookup", {"quote_number": "ZEL-000000-FAKE"})
+        lookup_status, _headers, lookup = client.post("/support/lookup", {"quote_number": "ZEL-000000-FAKE", "lookup_verifier": "80202"})
         self.assertTrue(lookup_status.startswith("404"))
         self.assertIn("No quote was found for that number", lookup)
         self.assertNotIn("michael@example.com", lookup)
+
+    def test_condition_questionnaire_answers_affect_value_or_explain_no_impact(self):
+        baseline = calculate_condition_offer(
+            self.store,
+            brand="Apple iPhone",
+            model="iPhone 15 Pro Max",
+            storage="256GB",
+            carrier="Unlocked",
+            condition="Good",
+            answers={},
+        )
+
+        value_changing_answers = {
+            "power_on": "no",
+            "buttons": "no",
+            "cameras": "no",
+            "charging": "no",
+            "swollen_battery": "yes",
+            "missing_parts": "yes",
+        }
+        for key, answer in value_changing_answers.items():
+            with self.subTest(answer=key):
+                offer = calculate_condition_offer(
+                    self.store,
+                    brand="Apple iPhone",
+                    model="iPhone 15 Pro Max",
+                    storage="256GB",
+                    carrier="Unlocked",
+                    condition="Good",
+                    answers={key: answer},
+                )
+                self.assertTrue(offer["eligible"])
+                self.assertNotEqual(offer["offer_cents"], baseline["offer_cents"])
+                self.assertIn(key.replace("_", " "), offer["adjustment_summary"].lower())
+
+        repair_history = calculate_condition_offer(
+            self.store,
+            brand="Apple iPhone",
+            model="iPhone 15 Pro Max",
+            storage="256GB",
+            carrier="Unlocked",
+            condition="Good",
+            answers={"repair_history": "yes"},
+        )
+        self.assertEqual(repair_history["offer_cents"], baseline["offer_cents"])
+        self.assertIn("Repair history noted", repair_history["adjustment_summary"])
+
+    def test_seller_submission_persists_hardware_adjusted_server_value(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+        payload = {
+            "brand": "Apple iPhone",
+            "model": "iPhone 15 Pro Max",
+            "storage": "256GB",
+            "carrier": "Unlocked",
+            "condition": "Good",
+            "estimated_payout_cents": "999999",
+            "power_on": "no",
+            "full_name": "Hardware Tester",
+            "email": "hardware@example.com",
+            "phone": "555-555-1001",
+            "street_address": "123 Main St",
+            "apartment": "",
+            "city": "Denver",
+            "state": "CO",
+            "zip_code": "80202",
+            "payout_method": "PayPal",
+            "terms_agree": "1",
+            "privacy_agree": "1",
+        }
+        expected = calculate_condition_offer(
+            self.store,
+            brand="Apple iPhone",
+            model="iPhone 15 Pro Max",
+            storage="256GB",
+            carrier="Unlocked",
+            condition="Good",
+            answers={"power_on": "no"},
+        )["offer_cents"]
+
+        status, _headers, body = client.post("/seller", payload)
+
+        self.assertTrue(status.startswith("200"), body)
+        saved = self.store.list_orders()[0]
+        self.assertEqual(saved["estimated_payout_cents"], expected)
+        self.assertIn("Power on issue", saved["adjustment_summary"])
+
+    def test_quote_numbers_are_high_entropy_and_duplicate_generation_retries(self):
+        stamp = datetime.now(timezone.utc).strftime("%y%m%d")
+        duplicate = f"ZEL-{stamp}-DEADBEEFDEADBEEF"
+        first_payload = self._order_payload(full_name="First Duplicate", email="first@example.com", quote_number=duplicate)
+        self.store.create_order(first_payload)
+
+        with mock.patch("loops_app.buyback.secrets.token_hex", side_effect=["deadbeefdeadbeef", "cafebabecafebabe"]):
+            second = self.store.create_order(self._order_payload(full_name="Retry Duplicate", email="retry@example.com"))
+
+        self.assertEqual(second["quote_number"], f"ZEL-{stamp}-CAFEBABECAFEBABE")
+        self.assertRegex(second["quote_number"], r"^ZEL-[0-9]{6}-[0-9A-F]{16}$")
+
+    def test_quote_status_lookup_requires_customer_verifier_and_hides_mismatches(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+        order = self.store.create_order(self._order_payload(full_name="Lookup Customer", email="lookup@example.com", zip_code="80202"))
+
+        no_verifier_status, _headers, no_verifier = client.post("/support/lookup", {"quote_number": order["quote_number"]})
+        wrong_status, _headers, wrong = client.post("/support/lookup", {"quote_number": order["quote_number"], "lookup_verifier": "99999"})
+        ok_status, _headers, ok = client.post("/support/lookup", {"quote_number": order["quote_number"], "lookup_verifier": "lookup@example.com"})
+
+        self.assertTrue(no_verifier_status.startswith("404"))
+        self.assertTrue(wrong_status.startswith("404"))
+        self.assertNotIn("Quote Created", no_verifier)
+        self.assertNotIn("Quote Created", wrong)
+        self.assertTrue(ok_status.startswith("200"))
+        self.assertIn("status: Quote Created", ok)
+
+    def test_catalog_json_is_script_safe_and_option_builder_uses_text_content(self):
+        malicious = "Bad </script><script>window.XSS=1</script> & \u2028 marker"
+        self.store.upsert_pricing(
+            brand=malicious,
+            model='Model "quoted" <img src=x onerror=alert(1)>',
+            storage="128GB & <tag>",
+            base_value_cents=10000,
+            maximum_payout_cents=12000,
+        )
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+
+        status, _headers, home = client.get("/")
+
+        self.assertTrue(status.startswith("200"))
+        self.assertNotIn("</script><script>window.XSS=1</script>", home)
+        self.assertNotIn("select.innerHTML", home)
+        self.assertIn("document.createElement('option')", home)
+        self.assertIn("textContent", home)
+        self.assertIn("Bad &lt;/script&gt;&lt;script&gt;window.XSS=1&lt;/script&gt;", home)
 
     def test_admin_authentication_fails_closed_updates_pricing_orders_and_shows_stats(self):
         app = create_app(self.db_path)
@@ -543,6 +684,28 @@ class BuybackSiteTests(unittest.TestCase):
         legacy_row = next(row for row in rows if row["brand"] == "Legacy")
         self.assertEqual(legacy_row["base_value_cents"], 12345)
         self.assertEqual(legacy_row["maximum_payout_cents"], 12345)
+
+    def _order_payload(self, **overrides):
+        payload = {
+            "brand": "Apple iPhone",
+            "model": "iPhone 15 Pro Max",
+            "storage": "256GB",
+            "carrier": "Unlocked",
+            "condition": "Good",
+            "estimated_payout_cents": 71500,
+            "full_name": "Michael Rod",
+            "email": "michael@example.com",
+            "phone": "555-100-2000",
+            "street_address": "123 Main St",
+            "apartment": "",
+            "city": "Denver",
+            "state": "CO",
+            "zip_code": "80202",
+            "payout_method": "Venmo",
+            "adjustment_summary": "Good condition",
+        }
+        payload.update(overrides)
+        return payload
 
 
 if __name__ == "__main__":

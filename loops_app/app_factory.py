@@ -15,6 +15,7 @@ from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
 
 from .buyback import (
+    NEUTRAL_CONDITION_ANSWERS,
     PAYOUT_METHODS,
     SUPPORTED_CONDITIONS,
     BuybackStore,
@@ -114,7 +115,7 @@ class BuybackApp:
 
     def _home_page(self, errors: list[str] | None = None) -> str:
         pricing = self.store.list_pricing(active_only=True)
-        catalog_json = json.dumps(pricing)
+        catalog_json = _script_safe_json(pricing)
         condition_options = "".join(f"<option>{html.escape(condition)}</option>" for condition in SUPPORTED_CONDITIONS)
         brand_cards = "".join(f"<button class='brand-card' data-brand='{html.escape(brand)}'><span>{brand.split()[0][0] if brand else 'Z'}</span>{html.escape(brand)}</button>" for brand in BRANDS)
         catalog_cards = self._catalog_cards(pricing)
@@ -175,7 +176,7 @@ class BuybackApp:
         payout_options = "".join(f"<option>{method}</option>" for method in PAYOUT_METHODS)
         return f"""
         <section class="seller glass" id="seller"><h2>Seller Information</h2><p>Guest checkout is allowed. Account creation is offered as a demo-only next step.</p><form method="post" action="/seller" class="form-grid">
-        <input type="hidden" name="brand" id="seller_brand"><input type="hidden" name="model" id="seller_model"><input type="hidden" name="storage" id="seller_storage"><input type="hidden" name="carrier" id="seller_carrier"><input type="hidden" name="condition" id="seller_condition"><input type="hidden" name="estimated_payout_cents" id="seller_estimated_payout_cents">{''.join(f'<input type="hidden" name="{html.escape(key)}" id="seller_{html.escape(key)}" value="no">' for key, _text in QUESTIONNAIRE)}<input type="hidden" name="legally_ineligible" id="seller_legally_ineligible" value="no">
+        <input type="hidden" name="brand" id="seller_brand"><input type="hidden" name="model" id="seller_model"><input type="hidden" name="storage" id="seller_storage"><input type="hidden" name="carrier" id="seller_carrier"><input type="hidden" name="condition" id="seller_condition"><input type="hidden" name="estimated_payout_cents" id="seller_estimated_payout_cents">{''.join(f'<input type="hidden" name="{html.escape(key)}" id="seller_{html.escape(key)}" value="{html.escape(NEUTRAL_CONDITION_ANSWERS.get(key, "no"))}">' for key, _text in QUESTIONNAIRE)}<input type="hidden" name="legally_ineligible" id="seller_legally_ineligible" value="no">
         <label>Full Name<input name="full_name" required></label><label>Email<input type="email" name="email" required></label><label>Phone Number<input name="phone" required></label><label>Street Address<input name="street_address" required></label><label>Apartment/Unit<input name="apartment"></label><label>City<input name="city" required></label><label>State<input name="state" required></label><label>ZIP Code<input name="zip_code" required></label><label>Preferred Payout Method<select name="payout_method" required>{payout_options}</select></label><label class="check"><input type="checkbox" name="terms_agree" value="1"> I agree to the terms.</label><label class="check"><input type="checkbox" name="privacy_agree" value="1"> I agree to the privacy policy.</label><button class="btn primary" type="submit">Accept Offer</button></form></section>
         """
 
@@ -184,7 +185,7 @@ class BuybackApp:
 
     def _submit_seller(self, data: dict[str, str]) -> tuple[HTTPStatus, str]:
         errors = validate_seller_fields(data)
-        answers = {key: data.get(key, "no") for key, _text in QUESTIONNAIRE}
+        answers = {key: data.get(key, NEUTRAL_CONDITION_ANSWERS.get(key, "no")) for key, _text in QUESTIONNAIRE}
         answers["legally_ineligible"] = data.get("legally_ineligible", "no")
         try:
             offer = calculate_condition_offer(self.store, brand=data.get("brand", ""), model=data.get("model", ""), storage=data.get("storage", ""), carrier=data.get("carrier", "Unlocked"), condition=data.get("condition", "Good"), answers=answers) if not errors else None
@@ -247,11 +248,13 @@ class BuybackApp:
         topics = ['value calculation','free shipping','inspection timing','value changes','payment methods','broken phones','data removal','activation lock','sale cancellation']
         topic_html = "".join(f"<article data-help-article><h2>{topic}</h2><p>Helpful demo guidance for {topic.lower()}.</p></article>" for topic in topics)
         support_script = """<script>function filterHelpArticles(){const q=(document.querySelector('[data-help-search]')?.value||'').toLowerCase();let shown=0;document.querySelectorAll('[data-help-article]').forEach(article=>{const match=article.innerText.toLowerCase().includes(q);article.hidden=!match;if(match) shown++;});document.querySelector('[data-help-empty]')?.toggleAttribute('hidden',shown!==0);}document.querySelector('[data-help-search]')?.addEventListener('input',filterHelpArticles);filterHelpArticles();</script>"""
-        return self._page("Support Center", f"<section class='glass'><h1>Support Center</h1><p>searchable help articles, FAQs, contact form, quote-status lookup, shipping help, payment help, and device preparation instructions.</p>{notice}<input data-help-search aria-label='Search help' placeholder='Search help articles'><form method='post' action='/support/lookup'><label>quote-status lookup<input name='quote_number'></label><button class='btn primary'>Look Up Quote</button></form><div class='cards'>{topic_html}</div><p data-help-empty hidden>No help articles match that search.</p><form><label>Contact form<textarea></textarea></label></form><h2>Shipping Help</h2><p>shipping help: package your phone safely.</p><h2>Payment Help</h2><p>payment help: PayPal, Venmo, bank transfer, digital prepaid card, mailed check.</p><h2>Device Preparation</h2><p>device preparation: back up data, remove locks, erase device.</p></section>{self._footer()}{support_script}")
+        return self._page("Support Center", f"<section class='glass'><h1>Support Center</h1><p>searchable help articles, FAQs, contact form, quote-status lookup, shipping help, payment help, and device preparation instructions.</p>{notice}<input data-help-search aria-label='Search help' placeholder='Search help articles'><form method='post' action='/support/lookup'><label>quote-status lookup<input name='quote_number'></label><label>Email or ZIP code verifier<input name='lookup_verifier'></label><button class='btn primary'>Look Up Quote</button></form><div class='cards'>{topic_html}</div><p data-help-empty hidden>No help articles match that search.</p><form><label>Contact form<textarea></textarea></label></form><h2>Shipping Help</h2><p>shipping help: package your phone safely.</p><h2>Payment Help</h2><p>payment help: PayPal, Venmo, bank transfer, digital prepaid card, mailed check.</p><h2>Device Preparation</h2><p>device preparation: back up data, remove locks, erase device.</p></section>{self._footer()}{support_script}")
 
     def _lookup_quote(self, data: dict[str, str]) -> tuple[HTTPStatus, str]:
         quote = self.store.get_order(data.get("quote_number", ""))
-        if quote is None:
+        verifier = data.get("lookup_verifier", "").strip().lower()
+        matches_verifier = bool(quote and verifier and verifier in {quote.get("email", "").strip().lower(), quote.get("zip_code", "").strip().lower()})
+        if quote is None or not matches_verifier:
             return HTTPStatus.NOT_FOUND, self._support_page("No quote was found for that number. Please check the quote number and try again.")
         return HTTPStatus.OK, self._support_page(f"Quote {quote['quote_number']} status: {quote['status']}")
 
@@ -324,15 +327,16 @@ class BuybackApp:
         const conditions = {json.dumps(list(SUPPORTED_CONDITIONS.keys()))};
         const questionKeys = {json.dumps([key for key, _text in QUESTIONNAIRE])};
         const ineligibleKeys = ['lost_stolen','financed','account_lock','legally_ineligible'];
+        const answerDefaults = {json.dumps(NEUTRAL_CONDITION_ANSWERS)};
         const questionnaireAnswers = Object.fromEntries(questionKeys.map(key=>[key,'']));
         let visibleCount = 8;
         const fields = ['brand','model','storage','carrier','condition'].reduce((acc,id)=>{{acc[id]=document.getElementById(id);return acc;}},{{}});
         const money = cents => '$'+(Math.max(0,cents)/100).toLocaleString(undefined,{{maximumFractionDigits:0}});
         function unique(values){{return [...new Set(values)].sort();}}
-        function options(select, values, label){{ if(!select) return; const prefix=label!==undefined?`<option value="">${{label}}</option>`:''; select.innerHTML=prefix+values.map(v=>`<option value="${{v}}">${{v}}</option>`).join(''); }}
+        function options(select, values, label){{ if(!select) return; select.replaceChildren(); if(label!==undefined){{ const option=document.createElement('option'); option.value=''; option.textContent=label; select.appendChild(option); }} values.forEach(value=>{{ const option=document.createElement('option'); option.value=value; option.textContent=value; select.appendChild(option); }}); }}
         function currentRow(){{return catalog.find(r=>r.brand===fields.brand?.value&&r.model===fields.model?.value&&r.storage===fields.storage?.value);}}
-        function calculateClientOffer(){{ const row=currentRow(); if(!row) return null; let cents; const adjustments=[fields.condition.value+' condition']; if(fields.condition.value==='Not Working'){{ cents=row.non_working_value_cents; adjustments.push('Not Working value applied'); }} else {{ cents=row.base_value_cents; const deductions={{'Brand New':0,'Like New':3000,'Good':row.condition_deduction_cents,'Fair':16000,'Damaged':30000}}; const deduction=deductions[fields.condition.value]||0; cents-=deduction; if(deduction) adjustments.push('Condition deduction -'+money(deduction)); }} if(fields.carrier.value==='Unlocked'&&row.carrier_adjustment_cents){{ cents+=row.carrier_adjustment_cents; adjustments.push('Unlocked carrier bonus +'+money(row.carrier_adjustment_cents)); }} if(questionnaireAnswers.cracked_screen==='yes'){{ cents-=row.screen_damage_deduction_cents; adjustments.push('Cracked screen -'+money(row.screen_damage_deduction_cents)); }} if(questionnaireAnswers.cracked_back_glass==='yes'){{ cents-=row.back_glass_deduction_cents; adjustments.push('Cracked back glass -'+money(row.back_glass_deduction_cents)); }} if(questionnaireAnswers.water_damage==='yes'){{ cents-=row.water_damage_deduction_cents; adjustments.push('Water damage -'+money(row.water_damage_deduction_cents)); }} if(questionnaireAnswers.deep_scratches==='yes'){{ cents-=2500; adjustments.push('Deep scratches -$25'); }} if(row.promotional_bonus_cents){{ cents+=row.promotional_bonus_cents; adjustments.push('Promotional bonus +'+money(row.promotional_bonus_cents)); }} cents=Math.max(0,Math.min(row.maximum_payout_cents,cents)); return {{row,cents,adjustments}};}}
-        function syncSellerFields(offer){{ [['seller_brand',fields.brand?.value],['seller_model',fields.model?.value],['seller_storage',fields.storage?.value],['seller_carrier',fields.carrier?.value],['seller_condition',fields.condition?.value],['seller_estimated_payout_cents',offer?offer.cents:0]].forEach(([id,value])=>{{const el=document.getElementById(id); if(el) el.value=value||'';}}); questionKeys.forEach(key=>{{const el=document.getElementById('seller_'+key); if(el) el.value=questionnaireAnswers[key]||'no';}}); }}
+        function calculateClientOffer(){{ const row=currentRow(); if(!row) return null; let cents; const adjustments=[fields.condition.value+' condition']; if(fields.condition.value==='Not Working'){{ cents=row.non_working_value_cents; adjustments.push('Not Working value applied'); }} else {{ cents=row.base_value_cents; const deductions={{'Brand New':0,'Like New':3000,'Good':row.condition_deduction_cents,'Fair':16000,'Damaged':30000}}; const deduction=deductions[fields.condition.value]||0; cents-=deduction; if(deduction) adjustments.push('Condition deduction -'+money(deduction)); }} if(fields.carrier.value==='Unlocked'&&row.carrier_adjustment_cents){{ cents+=row.carrier_adjustment_cents; adjustments.push('Unlocked carrier bonus +'+money(row.carrier_adjustment_cents)); }} if(questionnaireAnswers.cracked_screen==='yes'){{ cents-=row.screen_damage_deduction_cents; adjustments.push('Cracked screen -'+money(row.screen_damage_deduction_cents)); }} if(questionnaireAnswers.cracked_back_glass==='yes'){{ cents-=row.back_glass_deduction_cents; adjustments.push('Cracked back glass -'+money(row.back_glass_deduction_cents)); }} if(questionnaireAnswers.water_damage==='yes'){{ cents-=row.water_damage_deduction_cents; adjustments.push('Water damage -'+money(row.water_damage_deduction_cents)); }} if(questionnaireAnswers.deep_scratches==='yes'){{ cents-=2500; adjustments.push('Deep scratches -$25'); }} if(row.promotional_bonus_cents){{ cents+=row.promotional_bonus_cents; adjustments.push('Promotional bonus +'+money(row.promotional_bonus_cents)); }} if(questionnaireAnswers.power_on==='no'){{ cents=Math.min(cents,row.non_working_value_cents); adjustments.push('Power on issue - non-working value applied'); }} const hardwareDeductions=[['buttons','no',5000,'Buttons issue'],['cameras','no',7000,'Cameras issue'],['charging','no',6000,'Charging issue'],['swollen_battery','yes',10000,'Swollen battery'],['missing_parts','yes',9000,'Missing parts']]; hardwareDeductions.forEach(([key,trigger,deduction,label])=>{{ if(questionnaireAnswers[key]===trigger){{ cents-=deduction; adjustments.push(label+' -'+money(deduction)); }} }}); if(questionnaireAnswers.repair_history==='yes'){{ adjustments.push('Repair history noted - no automatic value impact'); }} cents=Math.max(0,Math.min(row.maximum_payout_cents,cents)); return {{row,cents,adjustments}};}}
+        function syncSellerFields(offer){{ [['seller_brand',fields.brand?.value],['seller_model',fields.model?.value],['seller_storage',fields.storage?.value],['seller_carrier',fields.carrier?.value],['seller_condition',fields.condition?.value],['seller_estimated_payout_cents',offer?offer.cents:0]].forEach(([id,value])=>{{const el=document.getElementById(id); if(el) el.value=value||'';}}); questionKeys.forEach(key=>{{const el=document.getElementById('seller_'+key); if(el) el.value=questionnaireAnswers[key]||answerDefaults[key]||'no';}}); }}
         function refreshQuoteReview(){{ const offer=calculateClientOffer(); const estimate=document.getElementById('estimate'); const hidden=document.getElementById('estimated_payout_cents'); const blocked=ineligibleKeys.some(key=>questionnaireAnswers[key]==='yes'); const accept=document.querySelector('[data-accept-offer]'); document.querySelector('[data-blocked]')?.toggleAttribute('hidden',!blocked); if(accept){{accept.toggleAttribute('hidden',blocked); accept.setAttribute('aria-disabled',blocked?'true':'false');}} if(!offer){{ if(estimate) estimate.textContent='Pricing unavailable'; syncSellerFields(null); return; }} if(estimate) estimate.textContent=money(offer.cents); if(hidden) hidden.value=offer.cents; document.querySelector('[data-review-device]').textContent=offer.row.brand+' '+offer.row.model; document.querySelector('[data-review-storage]').textContent=offer.row.storage; document.querySelector('[data-review-carrier]').textContent=fields.carrier.value; document.querySelector('[data-review-condition]').textContent=fields.condition.value; document.querySelector('[data-review-payout]').textContent=money(offer.cents); document.querySelector('[data-review-adjustments]').textContent=offer.adjustments.join('; '); document.querySelector('[data-adjustment-summary]').textContent=offer.adjustments.join('; '); syncSellerFields(offer); }}
         function refreshModels(){{ options(fields.model, unique(catalog.filter(r=>r.brand===fields.brand.value).map(r=>r.model))); refreshStorage(); }}
         function refreshStorage(){{ options(fields.storage, unique(catalog.filter(r=>r.brand===fields.brand.value&&r.model===fields.model.value).map(r=>r.storage))); refreshQuoteReview(); }}
@@ -364,6 +368,17 @@ CSS = """
 
 def _money(cents: int) -> str:
     return f"${cents / 100:,.2f}"
+
+
+def _script_safe_json(value: object) -> str:
+    return (
+        json.dumps(value)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
 
 
 def create_app(db_path: str | None = None) -> BuybackApp:

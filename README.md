@@ -78,7 +78,7 @@ Customer auth, shipping labels, payments, emails, review integrations, analytics
 
 ### Empty and failure states
 
-If the pricing table is empty, the public quote page shows a graceful “Pricing is not available yet” message and non-breaking catalog empty guidance. Unknown quote-status lookups return a safe not-found message without exposing customer data. Admin failures fail closed without stack traces, secrets, environment values, SQL errors, or debug metadata.
+If the pricing table is empty, the public quote page shows a graceful “Pricing is not available yet” message and non-breaking catalog empty guidance. Quote-status lookup requires the quote/order number plus the customer email address or ZIP code verifier; unknown, missing-verifier, or mismatched-verifier lookups return the same safe not-found message without exposing customer data. Admin failures fail closed without stack traces, secrets, environment values, SQL errors, or debug metadata.
 
 ## CI
 

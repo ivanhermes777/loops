@@ -19,6 +19,12 @@ SUPPORTED_CONDITIONS: dict[str, int] = {
 
 PAYOUT_METHODS = {"PayPal", "Venmo", "Bank Transfer", "Digital Prepaid Card", "Mailed Check"}
 INELIGIBLE_FLAGS = {"lost_stolen", "financed", "account_lock", "legally_ineligible"}
+NEUTRAL_CONDITION_ANSWERS = {
+    "power_on": "yes",
+    "buttons": "yes",
+    "cameras": "yes",
+    "charging": "yes",
+}
 
 SAMPLE_PRICING: tuple[dict[str, Any], ...] = (
     {"brand": "Apple iPhone", "model": "iPhone 15 Pro Max", "storage": "256GB", "newest_rank": 100, "base_value_cents": 76000, "maximum_payout_cents": 89000, "carrier_adjustment_cents": 2500, "condition_deduction_cents": 7000, "screen_damage_deduction_cents": 12000, "back_glass_deduction_cents": 6500, "water_damage_deduction_cents": 22000, "non_working_value_cents": 18000, "promotional_bonus_cents": 0},
@@ -261,10 +267,15 @@ class BuybackStore:
         return dict(row) if row else None
 
     def create_order(self, data: dict[str, Any]) -> dict[str, Any]:
-        quote_number = data.get("quote_number") or self._quote_number()
-        payload = {**data, "quote_number": quote_number, "created_at": datetime.now(timezone.utc).isoformat()}
-        with self._connect() as connection:
-            connection.execute(
+        explicit_quote_number = data.get("quote_number")
+        attempts = 1 if explicit_quote_number else 5
+        last_error: sqlite3.IntegrityError | None = None
+        for _attempt in range(attempts):
+            quote_number = explicit_quote_number or self._quote_number()
+            payload = {**data, "quote_number": quote_number, "created_at": datetime.now(timezone.utc).isoformat()}
+            try:
+                with self._connect() as connection:
+                    connection.execute(
                 """
                 INSERT INTO orders (quote_number, created_at, status, brand, model, storage, carrier, condition,
                     estimated_payout_cents, final_payout_cents, adjustment_summary, full_name, email, phone,
@@ -273,15 +284,22 @@ class BuybackStore:
                     :carrier, :condition, :estimated_payout_cents, :final_payout_cents, :adjustment_summary,
                     :full_name, :email, :phone, :street_address, :apartment, :city, :state, :zip_code, :payout_method)
                 """,
-                {
-                    **payload,
-                    "status": payload.get("status", "Quote Created"),
-                    "final_payout_cents": payload.get("final_payout_cents"),
-                    "adjustment_summary": payload.get("adjustment_summary", ""),
-                    "apartment": payload.get("apartment", ""),
-                },
-            )
-        return self.get_order(quote_number) or payload
+                        {
+                            **payload,
+                            "status": payload.get("status", "Quote Created"),
+                            "final_payout_cents": payload.get("final_payout_cents"),
+                            "adjustment_summary": payload.get("adjustment_summary", ""),
+                            "apartment": payload.get("apartment", ""),
+                        },
+                    )
+                return self.get_order(quote_number) or payload
+            except sqlite3.IntegrityError as error:
+                last_error = error
+                if explicit_quote_number:
+                    raise
+        if last_error:
+            raise last_error
+        raise RuntimeError("Unable to create a unique quote number")
 
     def list_orders(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -330,7 +348,7 @@ class BuybackStore:
 
     def _quote_number(self) -> str:
         stamp = datetime.now(timezone.utc).strftime("%y%m%d")
-        return f"ZEL-{stamp}-{secrets.token_hex(2).upper()}"
+        return f"ZEL-{stamp}-{secrets.token_hex(8).upper()}"
 
 
 def seed_sample_data(store: BuybackStore) -> None:
@@ -396,7 +414,10 @@ def calculate_offer(store: BuybackStore, *, brand: str, model: str, storage: str
 
 
 def calculate_condition_offer(store: BuybackStore, *, answers: dict[str, str], **details: Any) -> dict[str, Any]:
-    blocked = [flag for flag in INELIGIBLE_FLAGS if answers.get(flag) == "yes"]
+    normalized_answers = {key: value.strip().lower() for key, value in answers.items()}
+    for key, value in NEUTRAL_CONDITION_ANSWERS.items():
+        normalized_answers.setdefault(key, value)
+    blocked = [flag for flag in INELIGIBLE_FLAGS if normalized_answers.get(flag) == "yes"]
     if blocked:
         return {
             "eligible": False,
@@ -405,12 +426,39 @@ def calculate_condition_offer(store: BuybackStore, *, answers: dict[str, str], *
             "blocked_reasons": blocked,
         }
     mapped = {
-        "cracked_screen": answers.get("cracked_screen", "no"),
-        "cracked_back_glass": answers.get("cracked_back_glass", "no"),
-        "water_damage": answers.get("water_damage", "no"),
-        "deep_scratches": answers.get("deep_scratches", "no"),
+        "cracked_screen": normalized_answers.get("cracked_screen", "no"),
+        "cracked_back_glass": normalized_answers.get("cracked_back_glass", "no"),
+        "water_damage": normalized_answers.get("water_damage", "no"),
+        "deep_scratches": normalized_answers.get("deep_scratches", "no"),
     }
-    return calculate_offer(store, **details, **mapped)
+    offer = calculate_offer(store, **details, **mapped)
+    pricing = store.get_pricing(str(details.get("brand", "")), str(details.get("model", "")), str(details.get("storage", "")))
+    if pricing is None:
+        raise ValueError("Unsupported phone configuration")
+
+    payout = int(offer["offer_cents"])
+    adjustments = list(offer["adjustments"])
+    if normalized_answers.get("power_on") == "no":
+        payout = min(payout, int(pricing["non_working_value_cents"]))
+        adjustments.append("Power on issue - non-working value applied")
+    hardware_deductions = [
+        ("buttons", "no", 5000, "Buttons issue"),
+        ("cameras", "no", 7000, "Cameras issue"),
+        ("charging", "no", 6000, "Charging issue"),
+        ("swollen_battery", "yes", 10000, "Swollen battery"),
+        ("missing_parts", "yes", 9000, "Missing parts"),
+    ]
+    for key, trigger, deduction, label in hardware_deductions:
+        if normalized_answers.get(key) == trigger:
+            payout -= deduction
+            adjustments.append(f"{label} -{_money(deduction)}")
+    if normalized_answers.get("repair_history") == "yes":
+        adjustments.append("Repair history noted - no automatic value impact")
+    offer["offer_cents"] = max(0, min(int(pricing["maximum_payout_cents"]), payout))
+    offer["adjustments"] = adjustments
+    offer["adjustment_summary"] = "; ".join(adjustments)
+    offer["condition_multiplier"] = round(offer["offer_cents"] / int(pricing["base_value_cents"]), 4) if pricing["base_value_cents"] else 0
+    return offer
 
 
 def validate_seller_fields(data: dict[str, str]) -> list[str]:
