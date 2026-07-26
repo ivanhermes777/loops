@@ -53,8 +53,10 @@ def main() -> int:
     generation_command = run.call_args_list[1].args[0]
     if "--ignore-rules" in research_command or "--ignore-rules" in generation_command:
         raise RuntimeError("Hermes adapter must not disable Hermes rules")
-    if "web" not in research_command or "none" not in generation_command:
-        raise RuntimeError("Hermes adapter toolsets are not constrained as expected")
+    if "--toolsets" not in research_command or "web" not in research_command:
+        raise RuntimeError("Hermes research must enable the web toolset")
+    if "--toolsets" in generation_command or "none" in generation_command:
+        raise RuntimeError("Hermes generation must not pass the invalid none toolset")
     missing = [section for section in REQUIRED_BLUEPRINT_SECTIONS if f"## {section}" not in generated]
     if missing:
         raise RuntimeError(f"Blueprint is missing sections: {', '.join(missing)}")

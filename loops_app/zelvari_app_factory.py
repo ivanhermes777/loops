@@ -47,18 +47,9 @@ HERMES_CODEX_UNAVAILABLE_MESSAGE = (
     "Restore Hermes CLI access and OpenAI Codex OAuth authentication, then retry."
 )
 
-LOCAL_AI_UNAVAILABLE_MESSAGE = (
-    "The local AI backend is unavailable. Confirm that the configured local model/service "
-    "is running, reachable, and matches your ZELVARI_LOCAL_LLM_* settings."
-)
-
 
 class HermesUnavailableError(RuntimeError):
     """Raised when Hermes cannot research or generate through Codex OAuth."""
-
-
-class LocalAIUnavailableError(RuntimeError):
-    """Raised when the configured local LLM backend is stopped or misconfigured."""
 
 
 class DuckDuckGoResearcher:
@@ -175,7 +166,7 @@ class Researcher(Protocol):
         ...
 
 
-class LocalLLM(Protocol):
+class BlueprintGenerator(Protocol):
     def generate_blueprint(
         self,
         idea: str,
@@ -227,11 +218,10 @@ class HermesCodexAgent:
             "app-factory",
             "--max-turns",
             "4" if enable_web else "1",
-            "--toolsets",
-            "web" if enable_web else "none",
-            "--query",
-            prompt,
         ]
+        if enable_web:
+            command.extend(["--toolsets", "web"])
+        command.extend(["--query", prompt])
         try:
             completed = subprocess.run(
                 command,
@@ -242,56 +232,13 @@ class HermesCodexAgent:
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise HermesUnavailableError(str(exc)) from exc
-        text = completed.stdout.strip()
+        text = _strip_hermes_cli_warnings(completed.stdout).strip()
         if completed.returncode != 0:
             detail = completed.stderr.strip() or text or f"Hermes exited with status {completed.returncode}"
             raise HermesUnavailableError(detail)
         if not text:
             raise HermesUnavailableError("Hermes returned an empty response")
         return text
-
-
-class LocalOllamaLLM:
-    """Configured local Ollama-compatible LLM backend for blueprint generation."""
-
-    def __init__(
-        self,
-        endpoint: str | None = None,
-        model: str | None = None,
-        timeout_seconds: float | None = None,
-    ):
-        self.endpoint = endpoint or os.getenv("ZELVARI_LOCAL_LLM_ENDPOINT", "http://127.0.0.1:11434/api/generate")
-        self.model = model or os.getenv("ZELVARI_LOCAL_LLM_MODEL", "llama3.1")
-        self.timeout_seconds = timeout_seconds or float(os.getenv("ZELVARI_LOCAL_LLM_TIMEOUT", "180"))
-
-    def generate_blueprint(
-        self,
-        idea: str,
-        findings: list[ResearchFinding],
-        *,
-        allow_ai_only: bool = False,
-    ) -> str:
-        prompt = _blueprint_prompt(idea, findings, allow_ai_only=allow_ai_only)
-        payload = json.dumps({"model": self.model, "prompt": prompt, "stream": False}).encode("utf-8")
-        request = urllib.request.Request(
-            self.endpoint,
-            data=payload,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                body = response.read().decode("utf-8")
-        except Exception as exc:
-            raise LocalAIUnavailableError(str(exc)) from exc
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise LocalAIUnavailableError("Local AI backend returned invalid JSON") from exc
-        text = str(data.get("response") or data.get("content") or data.get("message", {}).get("content", "")).strip()
-        if not text:
-            raise LocalAIUnavailableError("Local AI backend returned an empty blueprint")
-        return _ensure_blueprint_structure(text, idea, findings, allow_ai_only=allow_ai_only)
 
 
 class AppFactory:
@@ -302,7 +249,7 @@ class AppFactory:
         storage_path: str | Path = "data/app_factory_blueprints.json",
         *,
         researcher: Researcher | None = None,
-        llm: LocalLLM | None = None,
+        llm: BlueprintGenerator | None = None,
     ):
         self.storage_path = Path(storage_path)
         self.researcher = researcher or HermesCodexAgent()
@@ -404,8 +351,6 @@ class AppFactory:
                 research_findings=findings,
                 error_message=HERMES_CODEX_UNAVAILABLE_MESSAGE,
             )
-        except LocalAIUnavailableError:
-            return BlueprintResult(status="error", idea=idea, research_findings=findings, error_message=LOCAL_AI_UNAVAILABLE_MESSAGE)
         blueprint = _ensure_blueprint_structure(blueprint, idea, findings, allow_ai_only=allow_ai_only)
         result = BlueprintResult(
             id=uuid.uuid4().hex,
@@ -454,6 +399,8 @@ class LocalApp:
     def __call__(self, environ, start_response):
         method = environ.get("REQUEST_METHOD", "GET")
         path = environ.get("PATH_INFO", "/")
+        if not self._is_local_request(environ):
+            return _forbidden(start_response)
         if method == "POST" and path == "/blueprints":
             form = _read_form(environ)
             if not self._is_authorized_post(environ, form):
@@ -492,12 +439,15 @@ class LocalApp:
         body = self.render_home().encode("utf-8")
         return _response(start_response, "200 OK", body, headers=[("Content-Type", "text/html; charset=utf-8")])
 
+    def _is_local_request(self, environ) -> bool:
+        return _is_local_host(environ.get("HTTP_HOST", ""))
+
     def _is_authorized_post(self, environ, form: dict[str, str]) -> bool:
         token = form.get("admin_token", "")
         if not secrets.compare_digest(token, self.admin_token):
             return False
         host = environ.get("HTTP_HOST", "")
-        if not _is_local_host(host):
+        if not self._is_local_request(environ):
             return False
         for header in ("HTTP_ORIGIN", "HTTP_REFERER"):
             value = environ.get(header, "")
@@ -510,12 +460,17 @@ def create_app(
     storage_path: str | Path = "data/app_factory_blueprints.json",
     *,
     researcher: Researcher | None = None,
-    llm: LocalLLM | None = None,
+    llm: BlueprintGenerator | None = None,
 ) -> LocalApp:
     return LocalApp(AppFactory(storage_path, researcher=researcher, llm=llm))
 
 
 def run(host: str = "127.0.0.1", port: int = 8765) -> None:
+    if not _is_local_host(host):
+        raise SystemExit(
+            "Zelvari App Factory refuses non-loopback host binding without real authentication. "
+            "Use 127.0.0.1 or localhost for this local/admin-only MVP."
+        )
     app = create_app()
     try:
         server = make_server(host, port, app)
@@ -600,7 +555,7 @@ def _ensure_blueprint_structure(
     *,
     allow_ai_only: bool,
 ) -> str:
-    body = text.strip()
+    body = _strip_hermes_cli_warnings(text).strip()
     missing = [section for section in REQUIRED_BLUEPRINT_SECTIONS if f"## {section}" not in body]
     if missing:
         additions = []
@@ -608,6 +563,19 @@ def _ensure_blueprint_structure(
             additions.append(f"## {section}\n{_fallback_section(section, idea, findings, allow_ai_only)}")
         body = body + "\n\n" + "\n\n".join(additions)
     return body
+
+
+def _strip_hermes_cli_warnings(text: str) -> str:
+    """Remove Hermes CLI operational warnings before persisting blueprint content."""
+    clean_lines = []
+    for line in text.splitlines():
+        normalized = line.strip().lower()
+        if normalized.startswith("warning:"):
+            continue
+        if normalized.startswith("⚠") or "tirith security scanner" in normalized:
+            continue
+        clean_lines.append(line)
+    return "\n".join(clean_lines)
 
 
 def _fallback_section(section: str, idea: str, findings: list[ResearchFinding], allow_ai_only: bool) -> str:

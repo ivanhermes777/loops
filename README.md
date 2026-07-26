@@ -80,6 +80,8 @@ ZELVARI_HERMES_COMMAND=hermes
 ZELVARI_HERMES_TIMEOUT=360
 ```
 
+`ZELVARI_APP_FACTORY_HOST` must remain loopback-only (`127.0.0.1`, `localhost`, or `::1`) for this local/admin-only MVP. The app refuses non-loopback host binding unless a future issue adds a real authentication layer.
+
 Hermes Agent must be installed and the OpenAI Codex OAuth session must already be authenticated in the local Hermes environment. If Hermes Agent or the Codex OAuth session is unavailable, the app pauses with a clear recovery message instead of crashing.
 
 If web research fails or returns weak results, the app shows a warning, preserves partial findings when available, and lets the admin retry or continue with clearly labeled AI-only suggestions.
