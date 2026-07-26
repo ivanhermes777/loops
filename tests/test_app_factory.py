@@ -166,11 +166,53 @@ class AppFactoryTests(unittest.TestCase):
         generation_command = run.call_args_list[1].args[0]
         self.assertIn("--toolsets", research_command)
         self.assertIn("web", research_command)
+        self.assertIn("--provider", research_command)
+        self.assertIn("openai-codex", research_command)
+        self.assertIn("--provider", generation_command)
+        self.assertIn("openai-codex", generation_command)
         self.assertNotIn("--toolsets", generation_command)
         self.assertNotIn("none", generation_command)
         self.assertNotIn("http://127.0.0.1:11434/api/generate", " ".join(research_command + generation_command))
         self.assertNotIn("llama3.1", " ".join(research_command + generation_command))
         self.assertIn("## Monetization", result.blueprint_markdown)
+
+    def test_codex_provider_unavailable_does_not_fall_back_to_other_hermes_provider(self):
+        research_json = json.dumps(
+            [
+                {
+                    "category": finding.category,
+                    "summary": finding.summary,
+                    "source_title": finding.source_title,
+                    "source_url": finding.source_url,
+                    "source_detail": finding.source_detail,
+                }
+                for finding in self.good_findings
+            ]
+        )
+
+        with patch("subprocess.run") as run:
+            run.side_effect = [
+                type("Result", (), {"returncode": 0, "stdout": research_json, "stderr": ""})(),
+                type(
+                    "Result",
+                    (),
+                    {
+                        "returncode": 1,
+                        "stdout": "",
+                        "stderr": "openai-codex provider is unavailable; restore OAuth",
+                    },
+                )(),
+            ]
+            factory = AppFactory(self.storage_path)
+            result = factory.submit_idea("AI Codex outage verifier")
+
+        generation_command = run.call_args_list[1].args[0]
+        self.assertIn("--provider", generation_command)
+        self.assertIn("openai-codex", generation_command)
+        self.assertEqual(result.status, "error")
+        self.assertIn("Hermes Agent", result.error_message)
+        self.assertIn("OpenAI Codex OAuth", result.error_message)
+        self.assertEqual(factory.history(), [])
 
     def test_create_app_defaults_to_hermes_codex_workflow(self):
         app = create_app(self.storage_path)
@@ -283,11 +325,15 @@ class AppFactoryTests(unittest.TestCase):
         generation_command = run.call_args_list[1].args[0]
         self.assertEqual(research_command[:3], ["/opt/hermes", "chat", "--quiet"])
         self.assertNotIn("--ignore-rules", research_command)
+        self.assertIn("--provider", research_command)
+        self.assertIn("openai-codex", research_command)
         self.assertIn("--toolsets", research_command)
         self.assertIn("web", research_command)
         self.assertNotIn("-z", research_command)
         self.assertEqual(generation_command[:3], ["/opt/hermes", "chat", "--quiet"])
         self.assertNotIn("--ignore-rules", generation_command)
+        self.assertIn("--provider", generation_command)
+        self.assertIn("openai-codex", generation_command)
         self.assertNotIn("--toolsets", generation_command)
         self.assertNotIn("none", generation_command)
         self.assertNotIn("-z", generation_command)

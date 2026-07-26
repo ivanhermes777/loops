@@ -53,6 +53,10 @@ def main() -> int:
     generation_command = run.call_args_list[1].args[0]
     if "--ignore-rules" in research_command or "--ignore-rules" in generation_command:
         raise RuntimeError("Hermes adapter must not disable Hermes rules")
+    if "--provider" not in research_command or "openai-codex" not in research_command:
+        raise RuntimeError("Hermes research must pin the openai-codex provider")
+    if "--provider" not in generation_command or "openai-codex" not in generation_command:
+        raise RuntimeError("Hermes generation must pin the openai-codex provider")
     if "--toolsets" not in research_command or "web" not in research_command:
         raise RuntimeError("Hermes research must enable the web toolset")
     if "--toolsets" in generation_command or "none" in generation_command:

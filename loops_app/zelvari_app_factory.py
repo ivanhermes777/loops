@@ -46,6 +46,7 @@ HERMES_CODEX_UNAVAILABLE_MESSAGE = (
     "Hermes Agent or the authenticated OpenAI Codex OAuth session is unavailable. "
     "Restore Hermes CLI access and OpenAI Codex OAuth authentication, then retry."
 )
+HERMES_CODEX_PROVIDER = "openai-codex"
 
 
 class HermesUnavailableError(RuntimeError):
@@ -216,6 +217,8 @@ class HermesCodexAgent:
             "--quiet",
             "--source",
             "app-factory",
+            "--provider",
+            HERMES_CODEX_PROVIDER,
             "--max-turns",
             "4" if enable_web else "1",
         ]
