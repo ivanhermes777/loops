@@ -1,11 +1,18 @@
 import io
 import os
+import re
 import tempfile
 import unittest
 from urllib.parse import urlencode
 
 from loops_app.app_factory import create_app
-from loops_app.buyback import BuybackStore, calculate_offer, seed_sample_pricing
+from loops_app.buyback import (
+    BuybackStore,
+    calculate_condition_offer,
+    calculate_offer,
+    seed_sample_data,
+    seed_sample_pricing,
+)
 
 
 class WsgiTestClient:
@@ -13,8 +20,8 @@ class WsgiTestClient:
         self.app = app
         self.cookies = {}
 
-    def get(self, path):
-        return self._request("GET", path)
+    def get(self, path, query=""):
+        return self._request("GET", path, query=query)
 
     def post(self, path, data):
         body = urlencode(data).encode("utf-8")
@@ -28,13 +35,13 @@ class WsgiTestClient:
             },
         )
 
-    def _request(self, method, path, body=b"", headers=None):
+    def _request(self, method, path, query="", body=b"", headers=None):
         headers = headers or {}
         status_headers = {}
         environ = {
             "REQUEST_METHOD": method,
             "PATH_INFO": path,
-            "QUERY_STRING": "",
+            "QUERY_STRING": query,
             "SERVER_NAME": "localhost",
             "SERVER_PORT": "80",
             "wsgi.version": (1, 0),
@@ -69,155 +76,253 @@ class BuybackSiteTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tempdir.name, "buyback.sqlite3")
         self.store = BuybackStore(self.db_path)
-        seed_sample_pricing(self.store)
+        seed_sample_data(self.store)
         self.addCleanup(self.tempdir.cleanup)
+        os.environ.pop("BUYBACK_ADMIN_USERNAME", None)
+        os.environ.pop("BUYBACK_ADMIN_PASSWORD", None)
 
-    def test_calculates_offer_from_pricing_table_and_condition_multiplier(self):
-        iphone_offer = calculate_offer(
+    def test_quote_calculation_uses_editable_pricing_carrier_condition_damage_bonus_fields(self):
+        offer = calculate_offer(
             self.store,
-            brand="iPhone",
-            model="iPhone 15 Pro",
+            brand="Apple iPhone",
+            model="iPhone 15 Pro Max",
             storage="256GB",
+            carrier="Unlocked",
             condition="Good",
+            cracked_screen="yes",
+            cracked_back_glass="yes",
+            water_damage="no",
         )
-        samsung_offer = calculate_offer(
+
+        self.assertEqual(offer["offer_cents"], 53000)
+        self.assertEqual(offer["maximum_payout_cents"], 89000)
+        self.assertIn("Good condition", offer["adjustments"])
+        self.assertTrue(any("Unlocked carrier bonus" in item for item in offer["adjustments"]))
+        self.assertTrue(any("Cracked screen" in item for item in offer["adjustments"]))
+        self.assertTrue(any("Cracked back glass" in item for item in offer["adjustments"]))
+
+    def test_condition_questionnaire_blocks_legally_ineligible_devices(self):
+        result = calculate_condition_offer(
             self.store,
             brand="Samsung Galaxy",
             model="Galaxy S24 Ultra",
             storage="512GB",
-            condition="Fair",
+            carrier="Verizon",
+            condition="Like New",
+            answers={"lost_stolen": "yes", "financed": "no", "account_lock": "no"},
         )
 
-        self.assertEqual(iphone_offer["offer_cents"], 54400)
-        self.assertEqual(samsung_offer["offer_cents"], 46200)
-        self.assertEqual(iphone_offer["condition_multiplier"], 0.85)
-        self.assertEqual(samsung_offer["condition_multiplier"], 0.70)
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["block_message"], "Zelvari cannot accept this device")
+        self.assertIn("legally eligible", result["block_explanation"])
 
-    def test_customer_selectors_hide_unsupported_models_storage_and_conditions(self):
+    def test_seller_submission_validates_required_fields_terms_privacy_and_saves_quote_number(self):
         app = create_app(self.db_path)
         client = WsgiTestClient(app)
 
-        status, _headers, body = client.get("/")
-
-        self.assertTrue(status.startswith("200"))
-        self.assertIn("iPhone 15 Pro", body)
-        self.assertIn("Galaxy S24 Ultra", body)
-        self.assertIn("256GB", body)
-        self.assertIn("New/Like New", body)
-        self.assertIn("Cracked/Damaged", body)
-        self.assertNotIn("Google Pixel", body)
-        self.assertNotIn("128GB", body)
-        self.assertNotIn("Manual Review", body)
-        self.assertNotIn("$0", body)
-
-    def test_valid_offer_request_is_saved_with_contact_device_estimate_and_notes(self):
-        app = create_app(self.db_path)
-        client = WsgiTestClient(app)
+        bad_status, _headers, bad_body = client.post("/seller", {"full_name": ""})
+        self.assertTrue(bad_status.startswith("400"))
+        self.assertIn("Full name is required", bad_body)
+        self.assertIn("Terms agreement is required", bad_body)
+        self.assertEqual(self.store.list_orders(), [])
 
         status, _headers, body = client.post(
-            "/request",
+            "/seller",
             {
-                "name": "Michael Rod",
+                "brand": "Apple iPhone",
+                "model": "iPhone 15 Pro Max",
+                "storage": "256GB",
+                "carrier": "Unlocked",
+                "condition": "Good",
+                "estimated_payout_cents": "67600",
+                "full_name": "Michael Rod",
                 "email": "michael@example.com",
                 "phone": "555-100-2000",
-                "brand": "iPhone",
-                "model": "iPhone 15 Pro",
-                "storage": "256GB",
-                "condition": "Good",
-                "notes": "Unlocked and includes original box.",
+                "street_address": "123 Main St",
+                "apartment": "Unit 7",
+                "city": "Denver",
+                "state": "CO",
+                "zip_code": "80202",
+                "payout_method": "PayPal",
+                "terms_agree": "1",
+                "privacy_agree": "1",
             },
         )
 
         self.assertTrue(status.startswith("200"))
         self.assertIn("Zelvari will follow up manually", body)
-        requests = self.store.list_offer_requests()
-        self.assertEqual(len(requests), 1)
-        saved = requests[0]
-        self.assertEqual(saved["name"], "Michael Rod")
-        self.assertEqual(saved["email"], "michael@example.com")
-        self.assertEqual(saved["phone"], "555-100-2000")
-        self.assertEqual(saved["brand"], "iPhone")
-        self.assertEqual(saved["model"], "iPhone 15 Pro")
-        self.assertEqual(saved["storage"], "256GB")
-        self.assertEqual(saved["condition"], "Good")
-        self.assertEqual(saved["estimate_cents"], 54400)
-        self.assertEqual(saved["notes"], "Unlocked and includes original box.")
+        self.assertRegex(body, r"ZEL-[0-9]{6}-[0-9A-F]{4}")
+        orders = self.store.list_orders()
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0]["quote_number"], re.search(r"ZEL-[0-9]{6}-[0-9A-F]{4}", body).group(0))
+        self.assertEqual(orders[0]["payout_method"], "PayPal")
 
-    def test_missing_required_customer_fields_show_errors_and_do_not_save(self):
+    def test_public_pages_include_premium_branding_catalog_support_demo_auth_dashboard_empty_states(self):
         app = create_app(self.db_path)
         client = WsgiTestClient(app)
 
-        status, _headers, body = client.post(
-            "/request",
-            {
-                "name": "",
-                "email": "",
-                "phone": "555-100-2000",
-                "brand": "iPhone",
-                "model": "iPhone 15 Pro",
-                "storage": "256GB",
-                "condition": "Good",
-            },
-        )
+        status, _headers, home = client.get("/")
+        self.assertTrue(status.startswith("200"))
+        for text in [
+            "ZELVARI",
+            "AI-Powered Quotes. Human Trust.",
+            "Sell Your Phone the Smart Way",
+            "the Smart Way",
+            "Get Your Instant Quote",
+            "Phone Brand",
+            "Phone Model",
+            "Storage",
+            "Carrier",
+            "Brand New",
+            "Like New",
+            "Good",
+            "Fair",
+            "Damaged",
+            "Not Working",
+            "Final value is confirmed after inspection.",
+            "No fees. No obligation. 100% free.",
+            "Choose Your Device",
+            "Get an Instant Offer",
+            "Ship It for Free",
+            "Get Paid Fast",
+            "Apple iPhone",
+            "Samsung Galaxy",
+            "Google Pixel",
+            "OnePlus",
+            "Motorola",
+            "Xiaomi",
+            "Nothing",
+            "Other Brands",
+            "Load More",
+            "No catalog matches",
+            "Why Choose Zelvari",
+            "Fast Payment",
+            "Free Shipping",
+            "Trusted Quotes",
+            "Secure Data Protection",
+            "Better for the Planet",
+            "Top Trade-In Values",
+            "Top Pick",
+            "Verified Seller",
+            "The smarter way to sell your phone.",
+            "Good for your wallet. Better for the planet.",
+            "mobile-menu-toggle",
+        ]:
+            self.assertIn(text, home)
 
-        self.assertTrue(status.startswith("400"))
-        self.assertIn("Name is required", body)
-        self.assertIn("Email is required", body)
-        self.assertEqual(self.store.list_offer_requests(), [])
+        dashboard_status, _headers, dashboard = client.get("/dashboard")
+        self.assertTrue(dashboard_status.startswith("200"))
+        for text in ["Active Quotes", "Shipping Status", "Devices Received", "Inspection Results", "Payments", "Completed Sales", "Saved Devices", "Profile", "Support", "Quote Created", "Payment Sent"]:
+            self.assertIn(text, dashboard)
 
-    def test_admin_routes_reject_unauthenticated_access_and_accept_env_login(self):
-        os.environ["BUYBACK_ADMIN_USERNAME"] = "michael"
-        os.environ["BUYBACK_ADMIN_PASSWORD"] = "safe-password"
-        self.addCleanup(os.environ.pop, "BUYBACK_ADMIN_USERNAME", None)
-        self.addCleanup(os.environ.pop, "BUYBACK_ADMIN_PASSWORD", None)
-        app = create_app(self.db_path)
-        client = WsgiTestClient(app)
+        auth_status, _headers, auth = client.get("/signin")
+        self.assertTrue(auth_status.startswith("200"))
+        for text in ["Sign Up", "Sign In", "Forgot Password", "Email Verification", "Secure Sessions", "Sign Out", "customer accounts are not active yet"]:
+            self.assertIn(text, auth)
 
-        blocked_status, _headers, blocked_body = client.get("/admin")
-        self.assertTrue(blocked_status.startswith("401"))
-        self.assertIn("Admin login required", blocked_body)
+        support_status, _headers, support = client.get("/support")
+        self.assertTrue(support_status.startswith("200"))
+        for text in ["Support Center", "searchable help articles", "quote-status lookup", "shipping help", "payment help", "device preparation", "activation lock", "sale cancellation"]:
+            self.assertIn(text, support)
 
-        login_status, _headers, login_body = client.post(
-            "/admin/login",
-            {"username": "michael", "password": "safe-password"},
-        )
-        self.assertTrue(login_status.startswith("200"))
-        self.assertIn("Pricing Table", login_body)
-        self.assertIn("Saved Offer Requests", login_body)
-
-    def test_admin_routes_fail_closed_with_forged_cookie_when_credentials_are_unset(self):
-        os.environ.pop("BUYBACK_ADMIN_USERNAME", None)
-        os.environ.pop("BUYBACK_ADMIN_PASSWORD", None)
-        app = create_app(self.db_path)
-        client = WsgiTestClient(app)
-        client.cookies["buyback_admin"] = "06700c44aaaf426a054948d7db657adee600e9550c1eda6baeb05be4d16c4891"
-        original_pricing = self.store.list_pricing(active_only=False)[0]
-        pricing_id = original_pricing["id"]
-
-        admin_status, _headers, admin_body = client.get("/admin")
-        update_status, _headers, _body = client.post(
-            "/admin/pricing/update",
-            {"id": str(pricing_id), "base_price_cents": "12345", "active": "1"},
-        )
-
-        self.assertTrue(admin_status.startswith("401"))
-        self.assertNotIn("Pricing Table", admin_body)
-        self.assertNotIn("Saved Offer Requests", admin_body)
-        self.assertTrue(update_status.startswith("401"))
-        unchanged = next(row for row in self.store.list_pricing(active_only=False) if row["id"] == pricing_id)
-        self.assertEqual(unchanged["base_price_cents"], original_pricing["base_price_cents"])
-
-    def test_empty_pricing_data_shows_graceful_no_options_state(self):
+    def test_empty_pricing_catalog_and_quote_status_lookup_have_safe_empty_states(self):
         empty_db = os.path.join(self.tempdir.name, "empty.sqlite3")
         BuybackStore(empty_db)
         app = create_app(empty_db)
         client = WsgiTestClient(app)
 
         status, _headers, body = client.get("/")
-
         self.assertTrue(status.startswith("200"))
         self.assertIn("Pricing is not available yet", body)
-        self.assertNotIn("<select", body)
+        self.assertIn("No catalog matches", body)
+
+        lookup_status, _headers, lookup = client.post("/support/lookup", {"quote_number": "ZEL-000000-FAKE"})
+        self.assertTrue(lookup_status.startswith("404"))
+        self.assertIn("No quote was found for that number", lookup)
+        self.assertNotIn("michael@example.com", lookup)
+
+    def test_admin_authentication_fails_closed_updates_pricing_orders_and_shows_stats(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+        first_price = self.store.list_pricing()[0]
+
+        forged = WsgiTestClient(app)
+        forged.cookies["buyback_admin"] = "not-real"
+        blocked_status, _headers, blocked_body = forged.get("/admin")
+        update_status, _headers, _body = forged.post("/admin/pricing/update", {"id": str(first_price["id"]), "base_value_cents": "12345"})
+        self.assertTrue(blocked_status.startswith("401"))
+        self.assertTrue(update_status.startswith("401"))
+        self.assertNotIn("SQL", blocked_body)
+
+        os.environ["BUYBACK_ADMIN_USERNAME"] = "michael"
+        os.environ["BUYBACK_ADMIN_PASSWORD"] = "safe-password"
+        self.addCleanup(os.environ.pop, "BUYBACK_ADMIN_USERNAME", None)
+        self.addCleanup(os.environ.pop, "BUYBACK_ADMIN_PASSWORD", None)
+
+        login_status, _headers, admin = client.post("/admin/login", {"username": "michael", "password": "safe-password"})
+        self.assertTrue(login_status.startswith("200"))
+        for text in ["Total Quotes", "Accepted Quotes", "Devices Received", "Devices Inspected", "Payments Sent", "Average Payout", "Conversion Rate", "Total Buyback Value", "Phone brands/models", "Reviews", "FAQs"]:
+            self.assertIn(text, admin)
+
+        pricing_status, _headers, pricing_body = client.post(
+            "/admin/pricing/update",
+            {"id": str(first_price["id"]), "base_value_cents": "77777", "maximum_payout_cents": "99999", "active": "1"},
+        )
+        self.assertTrue(pricing_status.startswith("200"))
+        self.assertIn("$999.99", pricing_body)
+        updated = next(row for row in self.store.list_pricing() if row["id"] == first_price["id"])
+        self.assertEqual(updated["base_value_cents"], 77777)
+
+        order = self.store.create_order(
+            {
+                "brand": "Apple iPhone",
+                "model": "iPhone 15 Pro Max",
+                "storage": "256GB",
+                "carrier": "Unlocked",
+                "condition": "Good",
+                "estimated_payout_cents": 67600,
+                "full_name": "Michael Rod",
+                "email": "michael@example.com",
+                "phone": "555-100-2000",
+                "street_address": "123 Main St",
+                "apartment": "",
+                "city": "Denver",
+                "state": "CO",
+                "zip_code": "80202",
+                "payout_method": "Venmo",
+                "adjustment_summary": "Good condition",
+            }
+        )
+        status_status, _headers, status_body = client.post(
+            "/admin/order/update",
+            {
+                "quote_number": order["quote_number"],
+                "status": "Payment Sent",
+                "inspection_result": "Approved",
+                "internal_notes": "Looks clean",
+                "decision": "Approved",
+                "final_payout_cents": "65000",
+                "payment_sent": "1",
+            },
+        )
+        self.assertTrue(status_status.startswith("200"))
+        self.assertIn("Payment Sent", status_body)
+        saved = self.store.get_order(order["quote_number"])
+        self.assertEqual(saved["status"], "Payment Sent")
+        self.assertEqual(saved["final_payout_cents"], 65000)
+
+    def test_demo_auth_flows_validate_but_do_not_store_customer_credentials(self):
+        app = create_app(self.db_path)
+        client = WsgiTestClient(app)
+
+        bad_status, _headers, bad_body = client.post("/signup", {"email": "not-an-email", "password": "123"})
+        self.assertTrue(bad_status.startswith("400"))
+        self.assertIn("Enter a valid email", bad_body)
+
+        ok_status, _headers, ok_body = client.post("/signup", {"email": "customer@example.com", "password": "long-enough"})
+        self.assertTrue(ok_status.startswith("200"))
+        self.assertIn("Demo account flow complete", ok_body)
+        self.assertEqual(self.store.count_demo_credentials(), 0)
 
 
 if __name__ == "__main__":

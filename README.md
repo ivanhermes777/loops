@@ -1,6 +1,6 @@
 # Zelvari Loops
 
-Hermes-native loop-controlled starter repository for Zelvari. This repository now includes a stdlib Python MVP cellphone buyback quote site for supported iPhone and Samsung Galaxy devices.
+Hermes-native loop-controlled starter repository for Zelvari. This repository includes a stdlib-only Python cellphone buyback demo website with SQLite pricing, quote/order persistence, demo customer flows, and protected admin tools.
 
 This repo is connected to:
 
@@ -22,9 +22,11 @@ This repo is connected to:
 python3 -m unittest discover -s tests -v
 ```
 
-## Cellphone Buyback MVP
+## Premium Cellphone Buyback Demo
 
-The buyback app lets a customer select a supported brand, model, storage size, and condition, view an estimated offer from the editable pricing table, and submit contact details for manual Zelvari follow-up. It intentionally does not include checkout, payouts, shipping labels, customer emails, or public price suggestions.
+The buyback app lets customers browse supported phones, estimate trade-in value, walk through a device-condition questionnaire, submit seller information as a guest, receive a generated quote/order number, and view polished demo account/dashboard/support screens.
+
+The app intentionally remains a Python standard-library WSGI app. It does **not** use Next.js, React, TypeScript, Tailwind, npm, or external services.
 
 ### Local setup
 
@@ -42,7 +44,7 @@ export BUYBACK_ADMIN_PASSWORD="your-secure-password"
 export BUYBACK_DB_PATH="buyback.sqlite3"
 ```
 
-3. Start the local app with sample iPhone and Samsung Galaxy pricing:
+3. Start the local app with realistic seeded demo pricing:
 
 ```bash
 python3 -m loops_app.app_factory --host 127.0.0.1 --port 8000 --seed-sample
@@ -66,9 +68,17 @@ http://127.0.0.1:8000/admin
 - `BUYBACK_ADMIN_PASSWORD` — required admin password for `/admin`.
 - `BUYBACK_DB_PATH` — optional SQLite database path. Defaults to `buyback.sqlite3`.
 
-### Empty pricing behavior
+### Seed/demo behavior
 
-If the pricing table is empty, the public quote page shows a graceful “Pricing is not available yet” message and no device selectors. Seed sample data locally with `--seed-sample`, or manage existing seeded rows from `/admin`.
+Running with `--seed-sample` seeds editable mock SQLite pricing for Apple iPhone, Samsung Galaxy, Google Pixel, OnePlus, Motorola, Xiaomi, Nothing, and Other Brands. The pricing fields include base value, maximum payout, carrier adjustment, condition deduction, screen damage deduction, back glass deduction, water damage deduction, non-working value, promotional bonus, and a newest-sort rank.
+
+### Demo/manual-only limitations
+
+Customer auth, shipping labels, payments, emails, review integrations, analytics, CRM, carrier checks, identity checks, and external trust metrics are demo/manual only. The demo auth screens validate fields and show realistic messages, but customer login credentials are not stored.
+
+### Empty and failure states
+
+If the pricing table is empty, the public quote page shows a graceful “Pricing is not available yet” message and non-breaking catalog empty guidance. Unknown quote-status lookups return a safe not-found message without exposing customer data. Admin failures fail closed without stack traces, secrets, environment values, SQL errors, or debug metadata.
 
 ## CI
 
