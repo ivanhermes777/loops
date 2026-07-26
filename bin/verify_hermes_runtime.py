@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from loops_app.app_factory import HermesCodexAgent, REQUIRED_BLUEPRINT_SECTIONS, ResearchFinding  # noqa: E402
+from loops_app.zelvari_app_factory import HermesCodexAgent, REQUIRED_BLUEPRINT_SECTIONS, ResearchFinding  # noqa: E402
 
 
 def main() -> int:

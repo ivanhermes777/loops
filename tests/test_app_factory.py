@@ -7,7 +7,7 @@ from urllib.error import URLError
 from urllib.parse import urlencode
 from unittest.mock import patch
 
-from loops_app.app_factory import (
+from loops_app.zelvari_app_factory import (
     AppFactory,
     BlueprintResult,
     DuckDuckGoResearcher,

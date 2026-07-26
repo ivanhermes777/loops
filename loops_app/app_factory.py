@@ -1,904 +1,388 @@
-"""Local/admin-only Zelvari App Factory blueprint MVP.
-
-The first version intentionally creates monetization-ready Markdown blueprints only.
-It does not generate app code, deploy apps, configure payments, or expose public
-account flows.
-"""
+"""Stdlib WSGI app factory for the Zelvari cellphone buyback MVP."""
 
 from __future__ import annotations
 
+import argparse
+import hashlib
+import hmac
 import html
 import json
 import os
-import re
-import secrets
-import shutil
-import subprocess
-import urllib.parse
-import urllib.request
-import uuid
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from http import HTTPStatus
 from pathlib import Path
-from typing import Iterable, Protocol
+from typing import Callable
+from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
 
-
-REQUIRED_BLUEPRINT_SECTIONS = (
-    "Pain Points",
-    "Urgency",
-    "Audience",
-    "Features",
-    "Monetization",
-    "Tech Plan",
-    "Launch Checklist",
-    "Risks",
+from .buyback import (
+    SUPPORTED_CONDITIONS,
+    BuybackStore,
+    calculate_offer,
+    seed_sample_pricing,
+    validate_request_fields,
 )
 
-RESEARCH_CATEGORIES = (
-    "pain points",
-    "urgency angles",
-    "audience signals",
-    "monetization opportunities",
-)
-
-HERMES_CODEX_UNAVAILABLE_MESSAGE = (
-    "Hermes Agent or the authenticated OpenAI Codex OAuth session is unavailable. "
-    "Restore Hermes CLI access and OpenAI Codex OAuth authentication, then retry."
-)
-
-LOCAL_AI_UNAVAILABLE_MESSAGE = (
-    "The local AI backend is unavailable. Confirm that the configured local model/service "
-    "is running, reachable, and matches your ZELVARI_LOCAL_LLM_* settings."
-)
+ResponseBody = str
+StartResponse = Callable[[str, list[tuple[str, str]]], None]
 
 
-class HermesUnavailableError(RuntimeError):
-    """Raised when Hermes cannot research or generate through Codex OAuth."""
+class BuybackApp:
+    def __init__(self, db_path: str):
+        self.store = BuybackStore(db_path)
 
-
-class LocalAIUnavailableError(RuntimeError):
-    """Raised when the configured local LLM backend is stopped or misconfigured."""
-
-
-class DuckDuckGoResearcher:
-    """Default no-login web researcher using DuckDuckGo HTML results."""
-
-    def __init__(self, endpoint: str | None = None, timeout_seconds: float | None = None):
-        self.endpoint = endpoint or os.getenv("ZELVARI_RESEARCH_ENDPOINT", "https://html.duckduckgo.com/html/")
-        self.timeout_seconds = timeout_seconds or float(os.getenv("ZELVARI_RESEARCH_TIMEOUT", "20"))
-
-    def research(self, idea: str) -> list[ResearchFinding]:
-        findings: list[ResearchFinding] = []
-        for category in RESEARCH_CATEGORIES:
-            try:
-                findings.append(self._search_category(idea, category))
-            except Exception as exc:
-                exc.partial_findings = findings  # type: ignore[attr-defined]
-                raise
-        return findings
-
-    def _search_category(self, idea: str, category: str) -> ResearchFinding:
-        query = f"{idea} app {category} market research"
-        payload = urllib.parse.urlencode({"q": query}).encode("utf-8")
-        request = urllib.request.Request(
-            self.endpoint,
-            data=payload,
-            headers={"User-Agent": "ZelvariAppFactory/1.0", "Content-Type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-            page = response.read().decode("utf-8", errors="replace")
-        links = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', page, flags=re.DOTALL)
-        snippets = re.findall(r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>|<div[^>]+class="result__snippet"[^>]*>(.*?)</div>', page, flags=re.DOTALL)
-        if not links:
-            raise RuntimeError(f"No useful web results for {category}")
-        raw_url, raw_title = links[0]
-        snippet_parts = snippets[0] if snippets else ("", "")
-        summary = _clean_html_text(next((part for part in snippet_parts if part), "Relevant market source found for this category."))
-        return ResearchFinding(
-            category=category,
-            summary=summary,
-            source_title=_clean_html_text(raw_title),
-            source_url=_extract_duckduckgo_url(html.unescape(raw_url)),
-            source_detail=f"DuckDuckGo result for query: {query}",
-        )
-
-
-@dataclass(frozen=True)
-class ResearchFinding:
-    category: str
-    summary: str
-    source_title: str
-    source_url: str
-    source_detail: str
-
-
-@dataclass(frozen=True)
-class HistoryItem:
-    id: str
-    title: str
-    created_at: str
-
-
-@dataclass(frozen=True)
-class HistoryState:
-    is_empty: bool
-    heading: str
-    description: str
-    primary_button_label: str
-    items: list[HistoryItem]
-
-
-@dataclass(frozen=True)
-class MarkdownExport:
-    filename: str
-    content_type: str
-    content: str
-
-
-@dataclass
-class BlueprintResult:
-    id: str = ""
-    pending_id: str = ""
-    idea: str = ""
-    status: str = "complete"
-    created_at: str = ""
-    research_findings: list[ResearchFinding] = field(default_factory=list)
-    blueprint_markdown: str = ""
-    warning_message: str = ""
-    error_message: str = ""
-    can_retry_research: bool = False
-    can_continue_with_ai_only: bool = False
-    used_ai_only_suggestions: bool = False
-
-    @property
-    def title(self) -> str:
-        return self.idea
-
-    @property
-    def cited_research_text(self) -> str:
-        if not self.research_findings:
-            return "No cited web research findings are available."
-        lines = []
-        for index, finding in enumerate(self.research_findings, start=1):
-            lines.append(
-                f"{index}. [{finding.category}] {finding.summary} "
-                f"— {finding.source_title} ({finding.source_url}); {finding.source_detail}"
-            )
-        return "\n".join(lines)
-
-
-class Researcher(Protocol):
-    def research(self, idea: str) -> list[ResearchFinding]:
-        """Return cited market research findings for the app idea."""
-        ...
-
-
-class LocalLLM(Protocol):
-    def generate_blueprint(
-        self,
-        idea: str,
-        findings: list[ResearchFinding],
-        *,
-        allow_ai_only: bool = False,
-    ) -> str:
-        """Generate a professional Markdown blueprint."""
-        ...
-
-
-class HermesCodexAgent:
-    """Hermes adapter backed by the user's authenticated OpenAI Codex session."""
-
-    def __init__(self, command: str | None = None, timeout_seconds: float | None = None):
-        self.command = command or os.getenv("ZELVARI_HERMES_COMMAND") or shutil.which("hermes") or "/home/hermes/.local/bin/hermes"
-        self.timeout_seconds = timeout_seconds or float(os.getenv("ZELVARI_HERMES_TIMEOUT", "360"))
-
-    def research(self, idea: str) -> list[ResearchFinding]:
-        prompt = (
-            "You are the research agent for Zelvari App Factory. Use Hermes web_search now; "
-            "do not answer from memory. Research this app idea for pain points, urgency, "
-            "audience signals, and monetization opportunities. Return ONLY a JSON array "
-            "containing 4 to 8 objects. Every object must contain the string fields category, "
-            "summary, source_title, source_url, and source_detail. source_url must be the real "
-            "http(s) URL returned by live search. Never use example.com, placeholders, invented "
-            f"sources, or Markdown fences.\n\nApp idea: {idea}"
-        )
-        raw = self._run(prompt, enable_web=True)
-        return _parse_hermes_findings(raw)
-
-    def generate_blueprint(
-        self,
-        idea: str,
-        findings: list[ResearchFinding],
-        *,
-        allow_ai_only: bool = False,
-    ) -> str:
-        prompt = _blueprint_prompt(idea, findings, allow_ai_only=allow_ai_only)
-        text = self._run(prompt, enable_web=False)
-        return _ensure_blueprint_structure(text, idea, findings, allow_ai_only=allow_ai_only)
-
-    def _run(self, prompt: str, *, enable_web: bool) -> str:
-        command = [
-            self.command,
-            "chat",
-            "--quiet",
-            "--source",
-            "app-factory",
-            "--max-turns",
-            "4" if enable_web else "1",
-            "--toolsets",
-            "web" if enable_web else "none",
-            "--query",
-            prompt,
-        ]
-        try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise HermesUnavailableError(str(exc)) from exc
-        text = completed.stdout.strip()
-        if completed.returncode != 0:
-            detail = completed.stderr.strip() or text or f"Hermes exited with status {completed.returncode}"
-            raise HermesUnavailableError(detail)
-        if not text:
-            raise HermesUnavailableError("Hermes returned an empty response")
-        return text
-
-
-class LocalOllamaLLM:
-    """Configured local Ollama-compatible LLM backend for blueprint generation."""
-
-    def __init__(
-        self,
-        endpoint: str | None = None,
-        model: str | None = None,
-        timeout_seconds: float | None = None,
-    ):
-        self.endpoint = endpoint or os.getenv("ZELVARI_LOCAL_LLM_ENDPOINT", "http://127.0.0.1:11434/api/generate")
-        self.model = model or os.getenv("ZELVARI_LOCAL_LLM_MODEL", "llama3.1")
-        self.timeout_seconds = timeout_seconds or float(os.getenv("ZELVARI_LOCAL_LLM_TIMEOUT", "180"))
-
-    def generate_blueprint(
-        self,
-        idea: str,
-        findings: list[ResearchFinding],
-        *,
-        allow_ai_only: bool = False,
-    ) -> str:
-        prompt = _blueprint_prompt(idea, findings, allow_ai_only=allow_ai_only)
-        payload = json.dumps({"model": self.model, "prompt": prompt, "stream": False}).encode("utf-8")
-        request = urllib.request.Request(
-            self.endpoint,
-            data=payload,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                body = response.read().decode("utf-8")
-        except Exception as exc:
-            raise LocalAIUnavailableError(str(exc)) from exc
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise LocalAIUnavailableError("Local AI backend returned invalid JSON") from exc
-        text = str(data.get("response") or data.get("content") or data.get("message", {}).get("content", "")).strip()
-        if not text:
-            raise LocalAIUnavailableError("Local AI backend returned an empty blueprint")
-        return _ensure_blueprint_structure(text, idea, findings, allow_ai_only=allow_ai_only)
-
-
-class AppFactory:
-    """Core application service used by tests and the local HTTP UI."""
-
-    def __init__(
-        self,
-        storage_path: str | Path = "data/app_factory_blueprints.json",
-        *,
-        researcher: Researcher | None = None,
-        llm: LocalLLM | None = None,
-    ):
-        self.storage_path = Path(storage_path)
-        self.researcher = researcher or HermesCodexAgent()
-        self.llm = llm or HermesCodexAgent()
-        self._pending: dict[str, BlueprintResult] = {}
-
-    def submit_idea(self, idea: str) -> BlueprintResult:
-        idea = idea.strip()
-        if not idea:
-            return BlueprintResult(status="error", error_message="Please enter an app idea first.")
-        try:
-            findings = self.researcher.research(idea)
-        except Exception as exc:  # surfaced as research warning by design
-            partial_findings = list(getattr(exc, "partial_findings", []) or [])
-            return self._research_warning(idea, partial_findings)
-        if self._research_is_weak(findings):
-            return self._research_warning(idea, findings)
-        return self._generate_and_save(idea, findings, allow_ai_only=False)
-
-    def retry_research(self, pending_id: str) -> BlueprintResult:
-        pending = self._pending[pending_id]
-        return self.submit_idea(pending.idea)
-
-    def continue_with_ai_only(self, pending_id: str) -> BlueprintResult:
-        pending = self._pending[pending_id]
-        return self._generate_and_save(pending.idea, pending.research_findings, allow_ai_only=True)
-
-    def history(self) -> list[HistoryItem]:
-        return [
-            HistoryItem(id=item.id, title=item.idea, created_at=item.created_at)
-            for item in sorted(self._load_all(), key=lambda saved: saved.created_at, reverse=True)
-        ]
-
-    def history_state(self) -> HistoryState:
-        items = self.history()
-        return HistoryState(
-            is_empty=not items,
-            heading="No blueprints yet" if not items else "Project history",
-            description=(
-                "Create your first monetization-ready app blueprint. Your saved local projects "
-                "will appear here so you can reopen them later."
-                if not items
-                else "Reopen previous local/admin-only blueprints saved on this machine."
-            ),
-            primary_button_label="Create your first app blueprint" if not items else "Create another blueprint",
-            items=items,
-        )
-
-    def open_blueprint(self, blueprint_id: str) -> BlueprintResult:
-        for item in self._load_all():
-            if item.id == blueprint_id:
-                return item
-        raise KeyError(f"Blueprint not found: {blueprint_id}")
-
-    def export_markdown(self, blueprint_id: str) -> MarkdownExport:
-        blueprint = self.open_blueprint(blueprint_id)
-        slug = _slugify(blueprint.idea) or "app-blueprint"
-        content = _markdown_document(blueprint)
-        return MarkdownExport(
-            filename=f"{slug}.md",
-            content_type="text/markdown; charset=utf-8",
-            content=content,
-        )
-
-    def _research_warning(self, idea: str, findings: Iterable[ResearchFinding]) -> BlueprintResult:
-        pending_id = uuid.uuid4().hex
-        result = BlueprintResult(
-            pending_id=pending_id,
-            idea=idea,
-            status="research_warning",
-            research_findings=_sanitize_findings(findings),
-            warning_message=(
-                "Web research failed or returned weak results. Partial findings are preserved when available. "
-                "Retry research, or continue with clearly labeled AI-only suggestions."
-            ),
-            can_retry_research=True,
-            can_continue_with_ai_only=True,
-        )
-        self._pending[pending_id] = result
-        return result
-
-    def _research_is_weak(self, findings: list[ResearchFinding]) -> bool:
-        return len(findings) < 2
-
-    def _generate_and_save(
-        self,
-        idea: str,
-        findings: list[ResearchFinding],
-        *,
-        allow_ai_only: bool,
-    ) -> BlueprintResult:
-        findings = _sanitize_findings(findings)
-        try:
-            blueprint = self.llm.generate_blueprint(idea, findings, allow_ai_only=allow_ai_only)
-        except HermesUnavailableError:
-            return BlueprintResult(
-                status="error",
-                idea=idea,
-                research_findings=findings,
-                error_message=HERMES_CODEX_UNAVAILABLE_MESSAGE,
-            )
-        except LocalAIUnavailableError:
-            return BlueprintResult(status="error", idea=idea, research_findings=findings, error_message=LOCAL_AI_UNAVAILABLE_MESSAGE)
-        blueprint = _ensure_blueprint_structure(blueprint, idea, findings, allow_ai_only=allow_ai_only)
-        result = BlueprintResult(
-            id=uuid.uuid4().hex,
-            idea=idea,
-            status="complete",
-            created_at=datetime.now(timezone.utc).isoformat(),
-            research_findings=findings,
-            blueprint_markdown=blueprint,
-            used_ai_only_suggestions=allow_ai_only,
-        )
-        self._save(result)
-        return result
-
-    def _load_all(self) -> list[BlueprintResult]:
-        if not self.storage_path.exists():
-            return []
-        with self.storage_path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        return [_result_from_dict(item) for item in data]
-
-    def _save(self, result: BlueprintResult) -> None:
-        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-        existing = self._load_all()
-        existing.append(result)
-        with self.storage_path.open("w", encoding="utf-8") as handle:
-            json.dump([_result_to_dict(item) for item in existing], handle, indent=2)
-
-
-class LocalApp:
-    """Minimal stdlib web UI for local/admin use."""
-
-    def __init__(self, factory: AppFactory):
-        self.factory = factory
-        self.latest_result: BlueprintResult | None = None
-        self.admin_token = secrets.token_urlsafe(32)
-
-    def render_home(self) -> str:
-        history_state = self.factory.history_state()
-        latest = self.latest_result
-        return _page_template(
-            history_html=_history_html(history_state),
-            latest_html=_latest_result_html(latest, self.admin_token),
-            admin_token=self.admin_token,
-        )
-
-    def __call__(self, environ, start_response):
+    def __call__(self, environ: dict, start_response: StartResponse):
         method = environ.get("REQUEST_METHOD", "GET")
         path = environ.get("PATH_INFO", "/")
-        if method == "POST" and path == "/blueprints":
-            form = _read_form(environ)
-            if not self._is_authorized_post(environ, form):
-                return _forbidden(start_response)
-            self.latest_result = self.factory.submit_idea(form.get("idea", ""))
-            return _response(start_response, "303 See Other", b"", headers=[("Location", "/")])
-        if method == "POST" and path == "/research/retry":
-            form = _read_form(environ)
-            if not self._is_authorized_post(environ, form):
-                return _forbidden(start_response)
-            self.latest_result = self.factory.retry_research(form["pending_id"])
-            return _response(start_response, "303 See Other", b"", headers=[("Location", "/")])
-        if method == "POST" and path == "/research/continue-ai-only":
-            form = _read_form(environ)
-            if not self._is_authorized_post(environ, form):
-                return _forbidden(start_response)
-            self.latest_result = self.factory.continue_with_ai_only(form["pending_id"])
-            return _response(start_response, "303 See Other", b"", headers=[("Location", "/")])
-        if method == "GET" and path.startswith("/blueprints/") and path.endswith(".md"):
-            blueprint_id = path.split("/")[2].removesuffix(".md")
-            export = self.factory.export_markdown(blueprint_id)
-            return _response(
+        try:
+            if method == "GET" and path == "/":
+                return self._send(start_response, HTTPStatus.OK, self._public_quote_page())
+            if method == "POST" and path == "/request":
+                status, body = self._submit_request(self._form_data(environ))
+                return self._send(start_response, status, body)
+            if method == "GET" and path == "/admin/login":
+                return self._send(start_response, HTTPStatus.OK, self._login_page())
+            if method == "POST" and path == "/admin/login":
+                status, body, headers = self._login(self._form_data(environ))
+                return self._send(start_response, status, body, headers=headers)
+            if method == "GET" and path == "/admin":
+                if not self._is_admin(environ):
+                    return self._send(start_response, HTTPStatus.UNAUTHORIZED, self._login_page("Admin login required"))
+                return self._send(start_response, HTTPStatus.OK, self._admin_page())
+            if method == "POST" and path == "/admin/pricing/update":
+                if not self._is_admin(environ):
+                    return self._send(start_response, HTTPStatus.UNAUTHORIZED, self._login_page("Admin login required"))
+                status, body = self._update_pricing(self._form_data(environ))
+                return self._send(start_response, status, body)
+            return self._send(start_response, HTTPStatus.NOT_FOUND, self._page("Not Found", "<p>Page not found.</p>"))
+        except Exception as error:  # pragma: no cover - defensive WSGI boundary
+            safe_error = html.escape(str(error))
+            return self._send(
                 start_response,
-                "200 OK",
-                export.content.encode("utf-8"),
-                headers=[
-                    ("Content-Type", export.content_type),
-                    ("Content-Disposition", f'attachment; filename="{export.filename}"'),
-                ],
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                self._page("Error", f"<p>Something went wrong: {safe_error}</p>"),
             )
-        if method == "GET" and path.startswith("/blueprints/"):
-            blueprint_id = path.split("/")[2]
-            self.latest_result = self.factory.open_blueprint(blueprint_id)
-            body = self.render_home().encode("utf-8")
-            return _response(start_response, "200 OK", body, headers=[("Content-Type", "text/html; charset=utf-8")])
-        body = self.render_home().encode("utf-8")
-        return _response(start_response, "200 OK", body, headers=[("Content-Type", "text/html; charset=utf-8")])
 
-    def _is_authorized_post(self, environ, form: dict[str, str]) -> bool:
-        token = form.get("admin_token", "")
-        if not secrets.compare_digest(token, self.admin_token):
-            return False
-        host = environ.get("HTTP_HOST", "")
-        if not _is_local_host(host):
-            return False
-        for header in ("HTTP_ORIGIN", "HTTP_REFERER"):
-            value = environ.get(header, "")
-            if value and not _is_same_local_origin(value, host):
-                return False
-        return True
+    def _send(
+        self,
+        start_response: StartResponse,
+        status: HTTPStatus,
+        body: ResponseBody,
+        *,
+        headers: list[tuple[str, str]] | None = None,
+    ):
+        response_headers = [
+            ("Content-Type", "text/html; charset=utf-8"),
+            ("Content-Length", str(len(body.encode("utf-8")))),
+        ]
+        if headers:
+            response_headers.extend(headers)
+        start_response(f"{status.value} {status.phrase}", response_headers)
+        return [body.encode("utf-8")]
 
+    def _form_data(self, environ: dict) -> dict[str, str]:
+        content_length = int(environ.get("CONTENT_LENGTH") or 0)
+        raw_body = environ["wsgi.input"].read(content_length).decode("utf-8")
+        return {key: values[0] for key, values in parse_qs(raw_body, keep_blank_values=True).items()}
 
-def create_app(
-    storage_path: str | Path = "data/app_factory_blueprints.json",
-    *,
-    researcher: Researcher | None = None,
-    llm: LocalLLM | None = None,
-) -> LocalApp:
-    return LocalApp(AppFactory(storage_path, researcher=researcher, llm=llm))
-
-
-def run(host: str = "127.0.0.1", port: int = 8765) -> None:
-    app = create_app()
-    try:
-        server = make_server(host, port, app)
-    except OSError as exc:
-        raise SystemExit(
-            f"Could not start Zelvari App Factory at http://{host}:{port}: {exc}. "
-            "If the port is busy, run with an override such as "
-            "ZELVARI_APP_FACTORY_PORT=8893 python3 -m loops_app.app_factory."
-        ) from exc
-    with server:
-        print(f"Zelvari App Factory running at http://{host}:{port}")
-        server.serve_forever()
-
-
-def _blueprint_prompt(idea: str, findings: list[ResearchFinding], *, allow_ai_only: bool) -> str:
-    research_block = "\n".join(f"- {finding.category}: {finding.summary} ({finding.source_url})" for finding in findings)
-    if allow_ai_only:
-        research_block = (research_block or "No strong cited sources available.") + "\nLabel any unsupported suggestions as AI-only."
-    sections = ", ".join(REQUIRED_BLUEPRINT_SECTIONS)
-    return (
-        "You are Zelvari App Factory running through Hermes Agent with authenticated OpenAI Codex OAuth. "
-        "Generate a professional monetization-ready app blueprint, not finished app code.\n"
-        f"Idea: {idea}\n"
-        f"Cited research findings:\n{research_block}\n"
-        f"Use Markdown and include exactly these level-two section headings: {sections}. "
-        "Return only the blueprint Markdown."
-    )
-
-
-def _parse_hermes_findings(raw: str) -> list[ResearchFinding]:
-    """Parse and validate the JSON-only live-search contract returned by Hermes."""
-    candidate = raw.strip()
-    fenced = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", candidate, flags=re.DOTALL | re.IGNORECASE)
-    if fenced:
-        candidate = fenced.group(1)
-    else:
-        start = candidate.find("[")
-        end = candidate.rfind("]")
-        if start >= 0 and end > start:
-            candidate = candidate[start : end + 1]
-    try:
-        payload = json.loads(candidate)
-    except json.JSONDecodeError as exc:
-        raise HermesUnavailableError("Hermes live search returned invalid JSON") from exc
-    if not isinstance(payload, list):
-        raise HermesUnavailableError("Hermes live search did not return a findings array")
-    findings: list[ResearchFinding] = []
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        fields = {
-            key: str(item.get(key, "")).strip()
-            for key in ("category", "summary", "source_title", "source_url", "source_detail")
-        }
-        safe_url = _safe_source_url(fields["source_url"])
-        host = urllib.parse.urlparse(safe_url).hostname or ""
-        if (
-            not all(fields.values())
-            or not safe_url
-            or host.lower() in {"example.com", "www.example.com"}
-            or "placeholder" in safe_url.lower()
-        ):
-            continue
-        findings.append(
-            ResearchFinding(
-                category=fields["category"],
-                summary=fields["summary"],
-                source_title=fields["source_title"],
-                source_url=safe_url,
-                source_detail=fields["source_detail"],
+    def _public_quote_page(self, errors: list[str] | None = None) -> str:
+        pricing = self.store.list_pricing(active_only=True)
+        if not pricing:
+            return self._page(
+                "Zelvari Phone Buyback",
+                """
+                <section class="hero">
+                  <p class="eyebrow">Zelvari Buyback</p>
+                  <h1>Instant cellphone buyback estimates</h1>
+                  <p>Pricing is not available yet. Please check back soon so Zelvari can provide an accurate offer.</p>
+                </section>
+                """,
             )
+
+        catalog_json = json.dumps(pricing)
+        conditions_json = json.dumps(list(SUPPORTED_CONDITIONS.keys()))
+        error_html = self._error_list(errors or [])
+        body = f"""
+        <section class="hero">
+          <p class="eyebrow">Zelvari Buyback</p>
+          <h1>Get an instant estimate for your iPhone or Samsung Galaxy.</h1>
+          <p>Select your supported phone details, view the estimate, then send your contact information for manual follow-up by Zelvari.</p>
+        </section>
+        {error_html}
+        <form class="card" method="post" action="/request" id="quote-form">
+          <div class="grid">
+            <label>Brand<select name="brand" id="brand" required></select></label>
+            <label>Model<select name="model" id="model" required></select></label>
+            <label>Storage<select name="storage" id="storage" required></select></label>
+            <label>Condition<select name="condition" id="condition" required></select></label>
+          </div>
+          <div class="estimate" id="estimate">Choose a supported phone to see an estimate.</div>
+          <div class="grid">
+            <label>Name<input name="name" required autocomplete="name"></label>
+            <label>Email<input type="email" name="email" required autocomplete="email"></label>
+            <label>Phone<input name="phone" required autocomplete="tel"></label>
+            <label>Optional notes<textarea name="notes" placeholder="Carrier, unlock status, accessories, or damage details"></textarea></label>
+          </div>
+          <button type="submit">Submit offer request</button>
+        </form>
+        <script>
+        const catalog = {catalog_json};
+        const conditions = {conditions_json};
+        const multipliers = {json.dumps(SUPPORTED_CONDITIONS)};
+        const fields = ['brand', 'model', 'storage', 'condition'].reduce((acc, id) => {{ acc[id] = document.getElementById(id); return acc; }}, {{}});
+        const estimate = document.getElementById('estimate');
+        function unique(values) {{ return [...new Set(values)].sort(); }}
+        function options(select, values) {{
+          select.innerHTML = values.map(value => `<option value="${{value}}">${{value}}</option>`).join('');
+        }}
+        function matching() {{
+          return catalog.filter(row => (!fields.brand.value || row.brand === fields.brand.value)
+            && (!fields.model.value || row.model === fields.model.value));
+        }}
+        function refreshModels() {{
+          const models = unique(catalog.filter(row => row.brand === fields.brand.value).map(row => row.model));
+          options(fields.model, models);
+          refreshStorage();
+        }}
+        function refreshStorage() {{
+          const rows = matching();
+          options(fields.storage, unique(rows.map(row => row.storage)));
+          refreshEstimate();
+        }}
+        function refreshEstimate() {{
+          const row = catalog.find(item => item.brand === fields.brand.value && item.model === fields.model.value && item.storage === fields.storage.value);
+          const multiplier = multipliers[fields.condition.value];
+          if (!row || !multiplier) {{ estimate.textContent = 'Choose a supported phone to see an estimate.'; return; }}
+          const dollars = Math.round(row.base_price_cents * multiplier) / 100;
+          estimate.textContent = `Estimated offer: $${{dollars.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}})}}`;
+        }}
+        options(fields.brand, unique(catalog.map(row => row.brand)));
+        options(fields.condition, conditions);
+        fields.brand.addEventListener('change', refreshModels);
+        fields.model.addEventListener('change', refreshStorage);
+        fields.storage.addEventListener('change', refreshEstimate);
+        fields.condition.addEventListener('change', refreshEstimate);
+        refreshModels();
+        </script>
+        """
+        return self._page("Zelvari Phone Buyback", body)
+
+    def _submit_request(self, data: dict[str, str]) -> tuple[HTTPStatus, str]:
+        errors = validate_request_fields(data)
+        if errors:
+            return HTTPStatus.BAD_REQUEST, self._public_quote_page(errors)
+        try:
+            offer = calculate_offer(
+                self.store,
+                brand=data["brand"].strip(),
+                model=data["model"].strip(),
+                storage=data["storage"].strip(),
+                condition=data["condition"].strip(),
+            )
+        except ValueError as error:
+            return HTTPStatus.BAD_REQUEST, self._public_quote_page([str(error)])
+        self.store.save_offer_request(
+            {
+                "name": data["name"].strip(),
+                "email": data["email"].strip(),
+                "phone": data["phone"].strip(),
+                "brand": offer["brand"],
+                "model": offer["model"],
+                "storage": offer["storage"],
+                "condition": offer["condition"],
+                "estimate_cents": offer["offer_cents"],
+                "base_price_cents": offer["base_price_cents"],
+                "condition_multiplier": offer["condition_multiplier"],
+                "notes": data.get("notes", "").strip(),
+            }
         )
-    if len(findings) < 2:
-        raise HermesUnavailableError("Hermes live search returned fewer than two valid cited findings")
-    return findings[:8]
-
-
-def _ensure_blueprint_structure(
-    text: str,
-    idea: str,
-    findings: list[ResearchFinding],
-    *,
-    allow_ai_only: bool,
-) -> str:
-    body = text.strip()
-    missing = [section for section in REQUIRED_BLUEPRINT_SECTIONS if f"## {section}" not in body]
-    if missing:
-        additions = []
-        for section in missing:
-            additions.append(f"## {section}\n{_fallback_section(section, idea, findings, allow_ai_only)}")
-        body = body + "\n\n" + "\n\n".join(additions)
-    return body
-
-
-def _fallback_section(section: str, idea: str, findings: list[ResearchFinding], allow_ai_only: bool) -> str:
-    qualifier = "AI-only suggestion: " if allow_ai_only else ""
-    research_hint = findings[0].summary if findings else "Validate this with stronger market research before launch."
-    return f"{qualifier}For {idea}, use the research signal: {research_hint}"
-
-
-def _markdown_document(result: BlueprintResult) -> str:
-    warning = "\n\n> AI-only suggestions were used because web research was weak or unavailable.\n" if result.used_ai_only_suggestions else ""
-    return (
-        "# Zelvari App Factory Blueprint\n\n"
-        f"**Idea:** {result.idea}\n\n"
-        "**First-version scope:** This is a monetization-ready blueprint, not a finished generated app.\n"
-        f"{warning}\n"
-        "## Research Findings\n\n"
-        f"{result.cited_research_text}\n\n"
-        f"{result.blueprint_markdown}\n"
-    )
-
-
-def _history_html(state: HistoryState) -> str:
-    if state.is_empty:
-        return (
-            '<aside class="history-sidebar glass-panel empty" aria-label="Project history"><p class="eyebrow">Project History</p>'
-            f"<h2>{html.escape(state.heading)}</h2>"
-            f"<p>{html.escape(state.description)}</p>"
-            f'<a class="primary secondary" href="#idea">{html.escape(state.primary_button_label)}</a></aside>'
+        amount = _money(offer["offer_cents"])
+        return HTTPStatus.OK, self._page(
+            "Request Submitted",
+            f"""
+            <section class="card success">
+              <p class="eyebrow">Request received</p>
+              <h1>Your estimated offer is {amount}.</h1>
+              <p>Zelvari will follow up manually to confirm the device details and next steps. This MVP does not process checkout, payouts, or shipping labels online.</p>
+              <a class="button-link" href="/">Start another quote</a>
+            </section>
+            """,
         )
-    items = "".join(
-        f'<li class="history-item"><span class="status-dot" aria-hidden="true"></span><div><strong>{html.escape(item.title)}</strong>'
-        f'<span>{html.escape(item.created_at)}</span><div class="history-actions">'
-        f'<a href="/blueprints/{html.escape(item.id)}">Reopen blueprint</a>'
-        f'<a href="/blueprints/{html.escape(item.id)}.md">Export Markdown</a></div></div></li>'
-        for item in state.items
-    )
-    return f'<aside class="history-sidebar glass-panel" aria-label="Project history"><p class="eyebrow">Project History</p><h2>{html.escape(state.heading)}</h2><p>{html.escape(state.description)}</p><ul>{items}</ul></aside>'
 
-
-def _latest_result_html(result: BlueprintResult | None, admin_token: str) -> str:
-    if result is None:
-        return ""
-    if result.status == "error":
-        return f'<section class="glass-panel alert"><h2>Generation paused</h2><p>{html.escape(result.error_message)}</p></section>'
-    if result.status == "research_warning":
-        findings = _research_list_html(result.research_findings)
-        return (
-            '<section class="glass-panel warning"><h2>Research needs attention</h2>'
-            f"<p>{html.escape(result.warning_message)}</p>{findings}"
-            '<div class="actions">'
-            f'<form method="post" action="/research/retry"><input type="hidden" name="admin_token" value="{html.escape(admin_token)}"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Retry research</button></form>'
-            f'<form method="post" action="/research/continue-ai-only"><input type="hidden" name="admin_token" value="{html.escape(admin_token)}"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Continue with AI-only suggestions</button></form>'
-            "</div></section>"
+    def _login_page(self, message: str = "") -> str:
+        notice = f"<p class='error'>{html.escape(message)}</p>" if message else ""
+        return self._page(
+            "Admin Login",
+            f"""
+            <section class="card narrow">
+              <h1>Admin login</h1>
+              <p>Pricing and saved requests are protected.</p>
+              {notice}
+              <form method="post" action="/admin/login">
+                <label>Username<input name="username" required></label>
+                <label>Password<input name="password" type="password" required></label>
+                <button type="submit">Log in</button>
+              </form>
+            </section>
+            """,
         )
-    findings = _research_list_html(result.research_findings)
-    return (
-        '<section class="glass-panel result"><div class="blueprint-deliverable"><p class="eyebrow">Completed Blueprint</p>'
-        f"<h2>{html.escape(result.idea)}</h2>{findings}"
-        f'<a class="primary" href="/blueprints/{html.escape(result.id)}.md">Export Markdown</a>'
-        f"<pre aria-label=\"Generated blueprint Markdown\">{html.escape(result.blueprint_markdown)}</pre></div></section>"
-    )
 
+    def _login(self, data: dict[str, str]) -> tuple[HTTPStatus, str, list[tuple[str, str]]]:
+        expected_username = os.environ.get("BUYBACK_ADMIN_USERNAME", "")
+        expected_password = os.environ.get("BUYBACK_ADMIN_PASSWORD", "")
+        supplied_username = data.get("username", "")
+        supplied_password = data.get("password", "")
+        if not expected_username or not expected_password:
+            return HTTPStatus.UNAUTHORIZED, self._login_page("Admin credentials are not configured."), []
+        if hmac.compare_digest(supplied_username, expected_username) and hmac.compare_digest(supplied_password, expected_password):
+            token = self._admin_token()
+            return HTTPStatus.OK, self._admin_page(), [("Set-Cookie", f"buyback_admin={token}; HttpOnly; SameSite=Lax; Path=/")]
+        return HTTPStatus.UNAUTHORIZED, self._login_page("Invalid admin username or password."), []
 
-def _research_list_html(findings: list[ResearchFinding]) -> str:
-    if not findings:
-        return '<p class="muted">No useful cited findings were collected yet.</p>'
-    items = "".join(_research_card_html(finding) for finding in findings)
-    return f"<h3>Cited research findings</h3><ul class=\"findings\">{items}</ul>"
+    def _admin_token(self) -> str | None:
+        username = os.environ.get("BUYBACK_ADMIN_USERNAME", "")
+        password = os.environ.get("BUYBACK_ADMIN_PASSWORD", "")
+        if not username or not password:
+            return None
+        secret = f"{username}:{password}".encode("utf-8")
+        return hmac.new(secret, b"zelvari-buyback-admin", hashlib.sha256).hexdigest()
 
+    def _is_admin(self, environ: dict) -> bool:
+        cookie_header = environ.get("HTTP_COOKIE", "")
+        cookies = dict(
+            item.strip().split("=", 1)
+            for item in cookie_header.split(";")
+            if "=" in item
+        )
+        token = cookies.get("buyback_admin", "")
+        expected = self._admin_token()
+        return bool(token and expected is not None and hmac.compare_digest(token, expected))
 
-def _research_card_html(finding: ResearchFinding) -> str:
-    safe_url = _safe_source_url(finding.source_url)
-    source_action = (
-        f'<a href="{html.escape(safe_url)}">Open source</a>'
-        if safe_url
-        else '<span class="muted">Source URL unavailable or rejected for safety</span>'
-    )
-    return (
-        '<li class="evidence-card">'
-        f'<div><p class="eyebrow">Source type: {html.escape(finding.category.title())}</p>'
-        f"<strong>{html.escape(finding.source_title)}</strong>"
-        f'<span class="credibility">Credibility cue: cited web source reviewed by admin</span></div>'
-        f"<p>{html.escape(finding.summary)}</p>"
-        f"{source_action}"
-        f'<span>{html.escape(finding.source_detail)}</span></li>'
-    )
+    def _admin_page(self, errors: list[str] | None = None) -> str:
+        rows = self.store.list_pricing(active_only=False)
+        requests = self.store.list_offer_requests()
+        pricing_rows = "".join(
+            f"""
+            <tr>
+              <td>{html.escape(row['brand'])}</td>
+              <td>{html.escape(row['model'])}</td>
+              <td>{html.escape(row['storage'])}</td>
+              <td>
+                <form method="post" action="/admin/pricing/update" class="inline-form">
+                  <input type="hidden" name="id" value="{row['id']}">
+                  <input name="base_price_cents" type="number" min="1" value="{row['base_price_cents']}" required>
+                  <label class="checkbox"><input name="active" type="checkbox" value="1" {'checked' if row['active'] else ''}> Active</label>
+                  <button type="submit">Save</button>
+                </form>
+              </td>
+            </tr>
+            """
+            for row in rows
+        ) or "<tr><td colspan='4'>No pricing records yet.</td></tr>"
+        request_rows = "".join(
+            f"""
+            <tr>
+              <td>{html.escape(row['created_at'])}</td>
+              <td>{html.escape(row['name'])}<br>{html.escape(row['email'])}<br>{html.escape(row['phone'])}</td>
+              <td>{html.escape(row['brand'])} {html.escape(row['model'])} {html.escape(row['storage'])}<br>{html.escape(row['condition'])}</td>
+              <td>{_money(row['estimate_cents'])}</td>
+              <td>{html.escape(row['notes'])}</td>
+            </tr>
+            """
+            for row in requests
+        ) or "<tr><td colspan='5'>No saved offer requests yet.</td></tr>"
+        body = f"""
+        <section class="card admin-card">
+          <h1>Pricing Table</h1>
+          {self._error_list(errors or [])}
+          <table><thead><tr><th>Brand</th><th>Model</th><th>Storage</th><th>Base Price / Status</th></tr></thead><tbody>{pricing_rows}</tbody></table>
+        </section>
+        <section class="card admin-card">
+          <h1>Saved Offer Requests</h1>
+          <table><thead><tr><th>Submitted</th><th>Customer</th><th>Device</th><th>Estimate</th><th>Notes</th></tr></thead><tbody>{request_rows}</tbody></table>
+        </section>
+        """
+        return self._page("Buyback Admin", body)
 
+    def _update_pricing(self, data: dict[str, str]) -> tuple[HTTPStatus, str]:
+        try:
+            pricing_id = int(data.get("id", ""))
+            base_price_cents = int(data.get("base_price_cents", ""))
+            if base_price_cents <= 0:
+                raise ValueError
+        except ValueError:
+            return HTTPStatus.BAD_REQUEST, self._admin_page(["Base price must be a positive number of cents."])
+        self.store.update_pricing(pricing_id, base_price_cents, data.get("active") == "1")
+        return HTTPStatus.OK, self._admin_page()
 
-def _page_template(*, history_html: str, latest_html: str, admin_token: str) -> str:
-    return f"""<!doctype html>
+    def _error_list(self, errors: list[str]) -> str:
+        if not errors:
+            return ""
+        items = "".join(f"<li>{html.escape(error)}</li>" for error in errors)
+        return f"<ul class='error'>{items}</ul>"
+
+    def _page(self, title: str, body: str) -> str:
+        return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Zelvari App Factory</title>
+  <title>{html.escape(title)}</title>
   <style>
-    :root {{ color-scheme: dark; --bg:#030712; --panel:rgba(10,22,42,.76); --panel-strong:rgba(16,30,56,.92); --line:rgba(129,199,255,.24); --text:#f3f8ff; --muted:#adc0d8; --cyan:#2ee8ff; --violet:#9d6bff; --blue:#4b8dff; --gold:#ffd166; }}
+    :root {{ color-scheme: dark; --bg:#08111f; --panel:#101c31; --line:#28415f; --accent:#38bdf8; --accent2:#7dd3fc; --text:#e5f4ff; --muted:#9fb5cc; --danger:#fca5a5; --success:#7dd3fc; }}
     * {{ box-sizing: border-box; }}
-    html {{ scroll-behavior:smooth; }}
-    body {{ margin:0; min-height:100vh; font-family: Inter, ui-sans-serif, system-ui, Segoe UI, sans-serif; background:radial-gradient(circle at 18% 10%, rgba(46,232,255,.2), transparent 28%), radial-gradient(circle at 84% 2%, rgba(157,107,255,.24), transparent 32%), linear-gradient(135deg,#020617 0%,#081426 52%,#020617 100%); color:var(--text); }}
-    body::before {{ content:""; position:fixed; inset:0; pointer-events:none; background:linear-gradient(120deg, transparent, rgba(46,232,255,.08), transparent); animation:aurora 10s ease-in-out infinite alternate; }}
-    main {{ width:min(1480px, 100%); margin:0 auto; padding:28px; position:relative; }}
-    .app-shell.command-center {{ display:grid; grid-template-columns:310px minmax(0,1fr); gap:24px; align-items:start; }}
-    .command-main {{ display:grid; gap:22px; }}
-    .workspace-hero {{ display:grid; grid-template-columns:minmax(0,1.05fr) minmax(340px,.95fr); gap:22px; align-items:stretch; }}
-    .glass-panel {{ border:1px solid var(--line); background:linear-gradient(145deg, rgba(9,20,39,.86), rgba(15,29,55,.68)); border-radius:28px; padding:28px; box-shadow:0 28px 90px rgba(0,0,0,.36), inset 0 1px 0 rgba(255,255,255,.08); backdrop-filter:blur(18px); transition:transform .22s ease, border-color .22s ease, box-shadow .22s ease; }}
-    .glass-panel:hover {{ transform:translateY(-2px); border-color:rgba(46,232,255,.48); box-shadow:0 32px 105px rgba(0,0,0,.44), 0 0 38px rgba(46,232,255,.1); }}
-    .panel {{ border:1px solid var(--line); background:var(--panel); border-radius:24px; padding:24px; }}
-    .eyebrow {{ color:var(--cyan); text-transform:uppercase; letter-spacing:.16em; font-size:.76rem; font-weight:800; }}
-    h1 {{ font-size:clamp(2.55rem, 6vw, 5.8rem); line-height:.88; margin:8px 0 16px; letter-spacing:-.07em; }}
-    h2 {{ margin-top:0; letter-spacing:-.03em; }}
-    h3 {{ letter-spacing:-.02em; }}
-    p {{ color:var(--muted); line-height:1.7; font-size:1rem; }}
-    label {{ display:block; margin:18px 0 8px; font-weight:800; }}
-    textarea {{ width:100%; min-height:190px; border-radius:22px; border:1px solid var(--line); background:rgba(3,9,20,.82); color:var(--text); padding:18px; font:inherit; box-shadow:inset 0 0 28px rgba(46,232,255,.05); }}
-    button, .primary {{ display:inline-flex; align-items:center; justify-content:center; border:0; border-radius:999px; padding:13px 19px; margin-top:14px; color:#03101d; background:linear-gradient(135deg,var(--cyan),var(--blue) 58%,var(--violet)); font-weight:900; text-decoration:none; cursor:pointer; box-shadow:0 14px 34px rgba(46,232,255,.2); transition:transform .2s ease, box-shadow .2s ease; }}
-    button:hover, .primary:hover {{ transform:translateY(-1px); box-shadow:0 18px 42px rgba(46,232,255,.3); }}
-    :focus-visible {{ outline:3px solid var(--gold); outline-offset:4px; }}
-    .secondary {{ background:linear-gradient(135deg,#effaff,#b9e8ff); }}
-    .scope {{ margin-top:18px; padding:16px 18px; border-radius:20px; background:rgba(3,9,20,.68); border:1px solid var(--line); color:#e5f4ff; }}
-    .research-pipeline {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; margin-top:22px; }}
-    .pipeline-stage {{ position:relative; min-height:94px; border:1px solid rgba(46,232,255,.22); border-radius:18px; padding:14px; background:rgba(8,18,34,.72); color:#dfeeff; overflow-wrap:normal; word-break:normal; }}
-    .pipeline-stage::before {{ content:""; display:block; width:10px; height:10px; border-radius:999px; margin-bottom:10px; background:var(--cyan); box-shadow:0 0 18px var(--cyan); animation:pulse 1.9s ease-in-out infinite; }}
-    .pipeline-stage span {{ display:block; color:var(--muted); font-size:.84rem; margin-top:4px; }}
-    .support-grid {{ display:grid; grid-template-columns:minmax(0,1fr) minmax(300px,.65fr); gap:22px; }}
-    ul {{ padding-left:0; list-style:none; }}
-    li {{ margin:0 0 12px; color:var(--muted); }}
-    .history-sidebar {{ position:sticky; top:24px; min-height:calc(100vh - 56px); }}
-    .history-item {{ display:flex; gap:12px; padding:14px; border:1px solid rgba(255,255,255,.08); border-radius:18px; background:rgba(255,255,255,.035); }}
-    .history-item strong, .evidence-card strong {{ display:block; color:var(--text); }}
-    .history-item span, .history-actions {{ display:block; color:#91a8c4; font-size:.88rem; margin-top:4px; }}
-    .history-actions {{ display:flex; gap:12px; flex-wrap:wrap; }}
-    .history-actions a, .findings a {{ color:#9be9ff; }}
-    .status-dot {{ width:10px; height:10px; flex:0 0 10px; margin-top:5px; border-radius:999px; background:var(--cyan); box-shadow:0 0 16px rgba(46,232,255,.8); }}
-    .findings {{ display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:14px; }}
-    .evidence-card {{ padding:18px; border:1px solid rgba(129,199,255,.22); border-radius:20px; background:linear-gradient(160deg, rgba(5,14,29,.92), rgba(20,31,58,.72)); }}
-    .evidence-card .eyebrow {{ margin:0 0 6px; }}
-    .evidence-card .credibility, .findings span {{ display:block; color:#9fb3cc; margin-top:6px; font-size:.9rem; }}
-    .warning {{ border-color:#fbbf24; }} .alert {{ border-color:#fb7185; }}
-    .actions {{ display:flex; gap:12px; flex-wrap:wrap; }}
-    .blueprint-deliverable pre {{ white-space:pre-wrap; background:linear-gradient(180deg, rgba(2,8,18,.96), rgba(5,14,28,.92)); border:1px solid rgba(46,232,255,.2); border-radius:22px; padding:22px; overflow:auto; line-height:1.68; box-shadow:inset 0 0 26px rgba(46,232,255,.04); }}
-    .muted {{ color:#8da1b8; }}
-    @keyframes aurora {{ from {{ opacity:.55; transform:translateX(-4%); }} to {{ opacity:.95; transform:translateX(4%); }} }}
-    @keyframes pulse {{ 0%,100% {{ transform:scale(.9); opacity:.75; }} 50% {{ transform:scale(1.12); opacity:1; }} }}
-    @media (prefers-reduced-motion: reduce) {{ *, *::before, *::after {{ animation:none !important; transition:none !important; scroll-behavior:auto !important; }} }}
-    @media (max-width: 1040px) {{ .app-shell.command-center, .workspace-hero, .support-grid {{ grid-template-columns:1fr; }} .history-sidebar {{ position:static; min-height:auto; order:3; }} .research-pipeline {{ grid-template-columns:1fr; }} }}
-    @media (max-width: 720px) {{ main {{ padding:16px; }} .glass-panel {{ padding:20px; border-radius:22px; }} .findings {{ grid-template-columns:1fr; }} h1 {{ font-size:clamp(2.25rem, 14vw, 3.8rem); }} }}
+    body {{ margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: radial-gradient(circle at top left, rgba(56,189,248,.22), transparent 32rem), linear-gradient(135deg, #07101d, #0d1728 45%, #111827); color:var(--text); min-height:100vh; padding:24px; }}
+    main {{ max-width:1100px; margin:0 auto; }}
+    .hero, .card {{ border:1px solid rgba(125,211,252,.22); background:rgba(16,28,49,.86); box-shadow:0 24px 80px rgba(0,0,0,.28); border-radius:28px; padding:28px; margin-bottom:22px; backdrop-filter: blur(14px); }}
+    .hero h1 {{ font-size:clamp(2rem, 6vw, 4.5rem); line-height:1; margin:8px 0 16px; max-width:900px; }}
+    .hero p, .card p {{ color:var(--muted); font-size:1.05rem; }}
+    .eyebrow {{ color:var(--accent2); text-transform:uppercase; letter-spacing:.18em; font-weight:700; font-size:.78rem; }}
+    .grid {{ display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:16px; margin:18px 0; }}
+    label {{ display:flex; flex-direction:column; gap:8px; color:#c7d7e7; font-weight:700; }}
+    input, select, textarea {{ width:100%; border:1px solid var(--line); border-radius:14px; background:#07111f; color:var(--text); padding:12px 14px; font:inherit; }}
+    textarea {{ min-height:92px; resize:vertical; }}
+    button, .button-link {{ border:0; border-radius:999px; background:linear-gradient(135deg, var(--accent), #2563eb); color:white; padding:13px 20px; font-weight:800; cursor:pointer; text-decoration:none; display:inline-flex; justify-content:center; }}
+    .estimate {{ border:1px solid rgba(56,189,248,.35); background:rgba(56,189,248,.10); color:#dff7ff; border-radius:18px; padding:18px; font-size:1.2rem; font-weight:800; }}
+    .error {{ color:var(--danger); }}
+    .success {{ border-color:rgba(125,211,252,.55); }}
+    .narrow {{ max-width:520px; margin-inline:auto; }}
+    table {{ width:100%; border-collapse:collapse; overflow:hidden; }}
+    th, td {{ border-bottom:1px solid var(--line); padding:12px; text-align:left; vertical-align:top; }}
+    th {{ color:var(--accent2); }}
+    .inline-form {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
+    .inline-form input[type='number'] {{ max-width:150px; }}
+    .checkbox {{ flex-direction:row; align-items:center; font-weight:600; }}
+    .checkbox input {{ width:auto; }}
+    @media (max-width:720px) {{ body {{ padding:14px; }} .hero, .card {{ padding:20px; border-radius:22px; }} .grid {{ grid-template-columns:1fr; }} table {{ display:block; overflow-x:auto; white-space:nowrap; }} }}
   </style>
 </head>
-<body>
-<main>
-  <div class="app-shell command-center">
-    {history_html}
-    <div class="command-main">
-      <section class="workspace-hero glass-panel">
-        <div>
-      <p class="eyebrow">Local/Admin Blueprint Studio</p>
-      <h1>Zelvari App Factory</h1>
-      <p>Create monetization-ready app blueprints from a raw idea using Hermes live web research and authenticated OpenAI Codex OAuth generation.</p>
-      <p class="scope"><strong>Agent online:</strong> Hermes Agent live web search · OpenAI Codex OAuth generation</p>
-      <p class="scope"><strong>Version 1 scope:</strong> this creates a monetization-ready blueprint, not a finished generated app. Markdown export only.</p>
-      <div class="research-pipeline" aria-label="Research pipeline progress">
-        <div class="pipeline-stage"><strong>Idea intake</strong><span>Capture the raw app opportunity.</span></div>
-        <div class="pipeline-stage"><strong>Market scan</strong><span>Find pain and urgency signals.</span></div>
-        <div class="pipeline-stage"><strong>Source review</strong><span>Surface cited evidence cards.</span></div>
-        <div class="pipeline-stage"><strong>Blueprint generation</strong><span>Use the governed Hermes Codex session.</span></div>
-        <div class="pipeline-stage"><strong>Export readiness</strong><span>Save locally and export Markdown only.</span></div>
-      </div>
-    </div>
-    <form id="idea" class="panel idea-console" method="post" action="/blueprints">
-      <p class="eyebrow">Primary Idea Flow</p>
-      <input type="hidden" name="admin_token" value="{html.escape(admin_token)}">
-      <label for="idea-input">App idea</label>
-      <textarea id="idea-input" name="idea" placeholder="Example: AI appointment recovery assistant for small clinics"></textarea>
-      <button type="submit" data-idle-label="Research and create blueprint">Research and create blueprint</button>
-      <p class="working-status" role="status" aria-live="polite"></p>
-      <p>Hermes live web research runs automatically for each submission, then the authenticated OpenAI Codex OAuth session generates the blueprint.</p>
-    </form>
-  </section>
-  <section class="support-grid">
-    <div>{latest_html or '<section class="glass-panel"><h2>Blueprint structure</h2><p>Each completed blueprint includes pain points, urgency, audience, features, monetization, tech plan, launch checklist, and risks.</p></section>'}</div>
-    <aside class="glass-panel" aria-label="Command center guidance"><p class="eyebrow">Operator Guidance</p><h2>Blueprint-only first version</h2><p>The workspace researches the market, cites sources, saves local history, and prepares a professional Markdown deliverable while avoiding account flows, billing setup, hosting deployment, PDF output, and completed app-code generation.</p></aside>
-  </section>
-    </div>
-  </div>
-</main>
-<script>
-  document.querySelectorAll("form").forEach((form) => {{
-    form.addEventListener("submit", () => {{
-      const button = form.querySelector("button[type=submit], button:not([type])");
-      if (!button) return;
-      button.disabled = true;
-      button.setAttribute("aria-busy", "true");
-      button.textContent = form.action.includes("/blueprints")
-        ? "Researching live sources…"
-        : "Codex OAuth is working…";
-      const status = form.querySelector(".working-status");
-      if (status) status.textContent = "Searching live sources, reviewing evidence, and generating your blueprint. This can take a minute.";
-    }});
-  }});
-</script>
-</body>
+<body><main>{body}</main></body>
 </html>"""
 
 
-def _response(start_response, status: str, body: bytes, headers: list[tuple[str, str]] | None = None):
-    start_response(status, headers or [("Content-Type", "text/plain; charset=utf-8")])
-    return [body]
+def _money(cents: int) -> str:
+    return f"${cents / 100:,.2f}"
 
 
-def _forbidden(start_response):
-    return _response(
-        start_response,
-        "403 Forbidden",
-        b"Local admin request rejected. Refresh the local App Factory page and submit from the rendered form.",
-    )
+def create_app(db_path: str | None = None) -> BuybackApp:
+    resolved_db_path = db_path or os.environ.get("BUYBACK_DB_PATH") or str(Path.cwd() / "buyback.sqlite3")
+    return BuybackApp(resolved_db_path)
 
 
-def _read_form(environ) -> dict[str, str]:
-    size = int(environ.get("CONTENT_LENGTH") or 0)
-    body = environ["wsgi.input"].read(size).decode("utf-8")
-    parsed = urllib.parse.parse_qs(body)
-    return {key: values[0] for key, values in parsed.items()}
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the Zelvari buyback MVP app.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
+    parser.add_argument("--db", default=os.environ.get("BUYBACK_DB_PATH", "buyback.sqlite3"))
+    parser.add_argument("--seed-sample", action="store_true", help="Seed supported iPhone and Samsung Galaxy sample pricing.")
+    args = parser.parse_args()
 
-
-def _safe_source_url(url: str) -> str:
-    parsed = urllib.parse.urlparse(url.strip())
-    if parsed.scheme in {"http", "https"} and parsed.netloc:
-        return urllib.parse.urlunparse(parsed)
-    return ""
-
-
-def _extract_duckduckgo_url(url: str) -> str:
-    parsed = urllib.parse.urlparse(url)
-    query_url = urllib.parse.parse_qs(parsed.query).get("uddg", [""])[0]
-    return _safe_source_url(query_url or url)
-
-
-def _clean_html_text(value: str) -> str:
-    without_tags = re.sub(r"<[^>]+>", " ", value)
-    return re.sub(r"\s+", " ", html.unescape(without_tags)).strip()
-
-
-def _is_local_host(host: str) -> bool:
-    parsed = urllib.parse.urlparse(f"//{host}")
-    hostname = (parsed.hostname or "").lower()
-    return hostname in {"localhost", "127.0.0.1", "::1"}
-
-
-def _is_same_local_origin(value: str, host: str) -> bool:
-    parsed = urllib.parse.urlparse(value)
-    if parsed.scheme not in {"http", "https"} or not _is_local_host(parsed.netloc):
-        return False
-    expected = urllib.parse.urlparse(f"//{host}")
-    return (parsed.hostname or "").lower() == (expected.hostname or "").lower() and parsed.port == expected.port
-
-
-def _sanitize_findings(findings: Iterable[ResearchFinding]) -> list[ResearchFinding]:
-    return [
-        ResearchFinding(
-            category=finding.category,
-            summary=finding.summary,
-            source_title=finding.source_title,
-            source_url=_safe_source_url(finding.source_url),
-            source_detail=finding.source_detail,
-        )
-        for finding in findings
-    ]
-
-
-def _slugify(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-    return slug[:80]
-
-
-def _result_to_dict(result: BlueprintResult) -> dict[str, object]:
-    data = asdict(result)
-    data["research_findings"] = [asdict(finding) for finding in result.research_findings]
-    return data
-
-
-def _result_from_dict(data: dict[str, object]) -> BlueprintResult:
-    raw_findings = data.get("research_findings", [])
-    findings = [ResearchFinding(**finding) for finding in raw_findings]  # type: ignore[arg-type]
-    copied = dict(data)
-    copied["research_findings"] = findings
-    return BlueprintResult(**copied)  # type: ignore[arg-type]
+    app = create_app(args.db)
+    if args.seed_sample:
+        seed_sample_pricing(app.store)
+    with make_server(args.host, args.port, app) as server:
+        print(f"Serving Zelvari buyback app on http://{args.host}:{args.port}")
+        server.serve_forever()
 
 
 if __name__ == "__main__":
-    run(
-        host=os.getenv("ZELVARI_APP_FACTORY_HOST", "127.0.0.1"),
-        port=int(os.getenv("ZELVARI_APP_FACTORY_PORT") or os.getenv("PORT") or "8765"),
-    )
+    main()
