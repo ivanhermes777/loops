@@ -1,0 +1,13 @@
+{
+  "command": [
+    "python3",
+    "-m",
+    "loops_app.app_factory",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "{port}",
+    "--seed-sample"
+  ],
+  "path": "/"
+}
