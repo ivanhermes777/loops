@@ -1,13 +1,9 @@
 {
   "command": [
     "python3",
-    "-m",
-    "loops_app.app_factory",
-    "--host",
-    "127.0.0.1",
-    "--port",
-    "{port}",
-    "--seed-sample"
+    "-c",
+    "import os, sys; sys.path.insert(0, '/mnt/c/ZELVARI_AI/finn-loop-hermes/workspace/jobs/job_ZEL_9/loops'); from loops_app.zelvari_app_factory import run; run(host='127.0.0.1', port=int(os.environ.get('PORT') or os.environ.get('ZELVARI_APP_FACTORY_PORT') or '8891'))"
   ],
-  "path": "/"
+  "path": "/",
+  "url": "http://127.0.0.1:8891/"
 }
