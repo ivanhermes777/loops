@@ -81,7 +81,7 @@ class AppFactoryTests(unittest.TestCase):
                 "## Monetization",
                 "Monthly admin-only SaaS subscription.",
                 "## Tech Plan",
-                "Local-first Python MVP with configured local LLM generation.",
+                "Local-first Python MVP with Hermes Agent and OpenAI Codex OAuth generation.",
                 "## Launch Checklist",
                 "Interview clinics and validate pricing.",
                 "## Risks",
@@ -119,45 +119,77 @@ class AppFactoryTests(unittest.TestCase):
         self.assertEqual(reopened.blueprint_markdown, result.blueprint_markdown)
         self.assertEqual(factory.history()[0].title, "AI appointment recovery for clinics")
 
-    def test_local_llm_unavailable_fails_gracefully_with_clear_admin_error(self):
+    def test_hermes_codex_unavailable_fails_gracefully_with_clear_admin_error(self):
         factory = AppFactory(
             self.storage_path,
             researcher=StubResearcher(self.good_findings),
-            llm=StubLLM(error=LocalAIUnavailableError("connection refused")),
+            llm=StubLLM(error=HermesUnavailableError("codex oauth missing")),
         )
 
         result = factory.submit_idea("AI quoting tool")
 
         self.assertEqual(result.status, "error")
-        self.assertIn("local AI backend is unavailable", result.error_message)
-        self.assertIn("configured local model/service", result.error_message)
+        self.assertIn("Hermes Agent", result.error_message)
+        self.assertIn("OpenAI Codex OAuth", result.error_message)
+        for forbidden in ["local LLM", "Ollama", "configured local model/service", "ZELVARI_LOCAL_LLM"]:
+            self.assertNotIn(forbidden, result.error_message)
         self.assertEqual(factory.history(), [])
 
-    def test_default_app_factory_uses_configured_local_llm_for_blueprint_generation(self):
-        blueprint = self.good_blueprint
+    def test_default_app_factory_uses_hermes_live_search_and_codex_oauth_generation(self):
+        research_json = json.dumps(
+            [
+                {
+                    "category": finding.category,
+                    "summary": finding.summary,
+                    "source_title": finding.source_title,
+                    "source_url": finding.source_url,
+                    "source_detail": finding.source_detail,
+                }
+                for finding in self.good_findings
+            ]
+        )
 
-        class FakeHTTPResponse:
-            def __enter__(self):
-                return self
+        with patch("subprocess.run") as run:
+            run.side_effect = [
+                type("Result", (), {"returncode": 0, "stdout": research_json, "stderr": ""})(),
+                type("Result", (), {"returncode": 0, "stdout": self.good_blueprint, "stderr": ""})(),
+            ]
+            factory = AppFactory(self.storage_path)
+            result = factory.submit_idea("AI Codex-first estimator")
 
-            def __exit__(self, exc_type, exc, traceback):
-                return False
-
-            def read(self):
-                return json.dumps({"response": blueprint}).encode("utf-8")
-
-        with patch("urllib.request.urlopen", return_value=FakeHTTPResponse()) as urlopen:
-            factory = AppFactory(self.storage_path, researcher=StubResearcher(self.good_findings))
-            result = factory.submit_idea("AI local-first estimator")
-
+        self.assertIsInstance(factory.researcher, HermesCodexAgent)
+        self.assertIsInstance(factory.llm, HermesCodexAgent)
         self.assertEqual(result.status, "complete")
-        request = urlopen.call_args.args[0]
-        payload = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(request.full_url, "http://127.0.0.1:11434/api/generate")
-        self.assertEqual(payload["model"], "llama3.1")
-        self.assertFalse(payload["stream"])
-        self.assertIn("configured local LLM", payload["prompt"])
+        research_command = run.call_args_list[0].args[0]
+        generation_command = run.call_args_list[1].args[0]
+        self.assertIn("--toolsets", research_command)
+        self.assertIn("web", research_command)
+        self.assertIn("--toolsets", generation_command)
+        self.assertIn("none", generation_command)
+        self.assertNotIn("http://127.0.0.1:11434/api/generate", " ".join(research_command + generation_command))
+        self.assertNotIn("llama3.1", " ".join(research_command + generation_command))
         self.assertIn("## Monetization", result.blueprint_markdown)
+
+    def test_create_app_defaults_to_hermes_codex_workflow(self):
+        app = create_app(self.storage_path)
+
+        self.assertIsInstance(app.factory.researcher, HermesCodexAgent)
+        self.assertIsInstance(app.factory.llm, HermesCodexAgent)
+
+    def test_hermes_unavailable_error_renders_codex_oauth_recovery_in_ui(self):
+        app = create_app(
+            self.storage_path,
+            researcher=StubResearcher(self.good_findings),
+            llm=StubLLM(error=HermesUnavailableError("missing session")),
+        )
+
+        call_wsgi(app, "POST", "/blueprints", form={"idea": "AI no-show helper", "admin_token": app.admin_token})
+        html = app.render_home()
+
+        self.assertIn("Hermes Agent", html)
+        self.assertIn("OpenAI Codex OAuth", html)
+        for forbidden in ["local LLM", "Ollama", "ZELVARI_LOCAL_LLM", "configured local model/service"]:
+            self.assertNotIn(forbidden, html)
 
     def test_local_ollama_llm_reports_misconfigured_or_stopped_backend_as_local_ai_unavailable(self):
         llm = LocalOllamaLLM(endpoint="http://127.0.0.1:9/api/generate", model="llama3.1", timeout_seconds=0.01)
@@ -252,12 +284,12 @@ class AppFactoryTests(unittest.TestCase):
         research_command = run.call_args_list[0].args[0]
         generation_command = run.call_args_list[1].args[0]
         self.assertEqual(research_command[:3], ["/opt/hermes", "chat", "--quiet"])
-        self.assertIn("--ignore-rules", research_command)
+        self.assertNotIn("--ignore-rules", research_command)
         self.assertIn("--toolsets", research_command)
         self.assertIn("web", research_command)
         self.assertNotIn("-z", research_command)
         self.assertEqual(generation_command[:3], ["/opt/hermes", "chat", "--quiet"])
-        self.assertIn("--ignore-rules", generation_command)
+        self.assertNotIn("--ignore-rules", generation_command)
         self.assertIn("--toolsets", generation_command)
         self.assertIn("none", generation_command)
         self.assertNotIn("-z", generation_command)
@@ -425,10 +457,12 @@ class AppFactoryTests(unittest.TestCase):
 
         self.assertIn("Zelvari App Factory", html)
         self.assertIn("Create monetization-ready app blueprints", html)
+        self.assertIn("Hermes Agent", html)
+        self.assertIn("OpenAI Codex OAuth", html)
         self.assertIn("blueprint, not a finished generated app", html)
         self.assertIn("No blueprints yet", html)
         self.assertIn("Create your first app blueprint", html)
-        forbidden = ["Sign up", "Login", "Customer account", "PDF export", "Deploy app", "Payment setup"]
+        forbidden = ["Sign up", "Login", "Customer account", "PDF export", "Deploy app", "Payment setup", "Ollama", "local LLM"]
         for phrase in forbidden:
             self.assertNotIn(phrase, html)
 
@@ -442,9 +476,10 @@ class AppFactoryTests(unittest.TestCase):
         self.assertIn('class="history-sidebar glass-panel"', html)
         self.assertIn('class="workspace-hero glass-panel"', html)
         self.assertIn('class="research-pipeline" aria-label="Research pipeline progress"', html)
-        self.assertIn("grid-template-columns:repeat(auto-fit, minmax(min(100%, 72px), 1fr))", html)
-        self.assertIn("min-width:0", html)
-        self.assertIn("overflow-wrap:anywhere", html)
+        self.assertIn("grid-template-columns:repeat(auto-fit, minmax(150px, 1fr))", html)
+        self.assertIn("overflow-wrap:normal", html)
+        self.assertIn("word-break:normal", html)
+        self.assertNotIn("overflow-wrap:anywhere", html)
         for stage in ["Idea intake", "Market scan", "Source review", "Blueprint generation", "Export readiness"]:
             self.assertIn(stage, html)
         self.assertIn('class="evidence-card"', html)

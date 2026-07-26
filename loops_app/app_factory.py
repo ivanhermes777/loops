@@ -42,6 +42,11 @@ RESEARCH_CATEGORIES = (
     "monetization opportunities",
 )
 
+HERMES_CODEX_UNAVAILABLE_MESSAGE = (
+    "Hermes Agent or the authenticated OpenAI Codex OAuth session is unavailable. "
+    "Restore Hermes CLI access and OpenAI Codex OAuth authentication, then retry."
+)
+
 LOCAL_AI_UNAVAILABLE_MESSAGE = (
     "The local AI backend is unavailable. Confirm that the configured local model/service "
     "is running, reachable, and matches your ZELVARI_LOCAL_LLM_* settings."
@@ -218,7 +223,6 @@ class HermesCodexAgent:
             self.command,
             "chat",
             "--quiet",
-            "--ignore-rules",
             "--source",
             "app-factory",
             "--max-turns",
@@ -301,8 +305,8 @@ class AppFactory:
         llm: LocalLLM | None = None,
     ):
         self.storage_path = Path(storage_path)
-        self.researcher = researcher or DuckDuckGoResearcher()
-        self.llm = llm or LocalOllamaLLM()
+        self.researcher = researcher or HermesCodexAgent()
+        self.llm = llm or HermesCodexAgent()
         self._pending: dict[str, BlueprintResult] = {}
 
     def submit_idea(self, idea: str) -> BlueprintResult:
@@ -393,7 +397,14 @@ class AppFactory:
         findings = _sanitize_findings(findings)
         try:
             blueprint = self.llm.generate_blueprint(idea, findings, allow_ai_only=allow_ai_only)
-        except (LocalAIUnavailableError, HermesUnavailableError):
+        except HermesUnavailableError:
+            return BlueprintResult(
+                status="error",
+                idea=idea,
+                research_findings=findings,
+                error_message=HERMES_CODEX_UNAVAILABLE_MESSAGE,
+            )
+        except LocalAIUnavailableError:
             return BlueprintResult(status="error", idea=idea, research_findings=findings, error_message=LOCAL_AI_UNAVAILABLE_MESSAGE)
         blueprint = _ensure_blueprint_structure(blueprint, idea, findings, allow_ai_only=allow_ai_only)
         result = BlueprintResult(
@@ -506,7 +517,15 @@ def create_app(
 
 def run(host: str = "127.0.0.1", port: int = 8765) -> None:
     app = create_app()
-    with make_server(host, port, app) as server:
+    try:
+        server = make_server(host, port, app)
+    except OSError as exc:
+        raise SystemExit(
+            f"Could not start Zelvari App Factory at http://{host}:{port}: {exc}. "
+            "If the port is busy, run with an override such as "
+            "ZELVARI_APP_FACTORY_PORT=8893 python3 -m loops_app.app_factory."
+        ) from exc
+    with server:
         print(f"Zelvari App Factory running at http://{host}:{port}")
         server.serve_forever()
 
@@ -517,7 +536,7 @@ def _blueprint_prompt(idea: str, findings: list[ResearchFinding], *, allow_ai_on
         research_block = (research_block or "No strong cited sources available.") + "\nLabel any unsupported suggestions as AI-only."
     sections = ", ".join(REQUIRED_BLUEPRINT_SECTIONS)
     return (
-        "You are Zelvari App Factory running through the configured local LLM backend. "
+        "You are Zelvari App Factory running through Hermes Agent with authenticated OpenAI Codex OAuth. "
         "Generate a professional monetization-ready app blueprint, not finished app code.\n"
         f"Idea: {idea}\n"
         f"Cited research findings:\n{research_block}\n"
@@ -640,7 +659,7 @@ def _latest_result_html(result: BlueprintResult | None, admin_token: str) -> str
             f"<p>{html.escape(result.warning_message)}</p>{findings}"
             '<div class="actions">'
             f'<form method="post" action="/research/retry"><input type="hidden" name="admin_token" value="{html.escape(admin_token)}"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Retry research</button></form>'
-            f'<form method="post" action="/research/continue-ai-only"><input type="hidden" name="admin_token" value="{html.escape(admin_token)}"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Continue with local AI-only suggestions</button></form>'
+            f'<form method="post" action="/research/continue-ai-only"><input type="hidden" name="admin_token" value="{html.escape(admin_token)}"><input type="hidden" name="pending_id" value="{html.escape(result.pending_id)}"><button>Continue with AI-only suggestions</button></form>'
             "</div></section>"
         )
     findings = _research_list_html(result.research_findings)
@@ -709,8 +728,8 @@ def _page_template(*, history_html: str, latest_html: str, admin_token: str) -> 
     :focus-visible {{ outline:3px solid var(--gold); outline-offset:4px; }}
     .secondary {{ background:linear-gradient(135deg,#effaff,#b9e8ff); }}
     .scope {{ margin-top:18px; padding:16px 18px; border-radius:20px; background:rgba(3,9,20,.68); border:1px solid var(--line); color:#e5f4ff; }}
-    .research-pipeline {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(min(100%, 72px), 1fr)); gap:12px; margin-top:22px; }}
-    .pipeline-stage {{ position:relative; min-width:0; min-height:94px; border:1px solid rgba(46,232,255,.22); border-radius:18px; padding:14px; background:rgba(8,18,34,.72); color:#dfeeff; overflow-wrap:anywhere; }}
+    .research-pipeline {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; margin-top:22px; }}
+    .pipeline-stage {{ position:relative; min-height:94px; border:1px solid rgba(46,232,255,.22); border-radius:18px; padding:14px; background:rgba(8,18,34,.72); color:#dfeeff; overflow-wrap:normal; word-break:normal; }}
     .pipeline-stage::before {{ content:""; display:block; width:10px; height:10px; border-radius:999px; margin-bottom:10px; background:var(--cyan); box-shadow:0 0 18px var(--cyan); animation:pulse 1.9s ease-in-out infinite; }}
     .pipeline-stage span {{ display:block; color:var(--muted); font-size:.84rem; margin-top:4px; }}
     .support-grid {{ display:grid; grid-template-columns:minmax(0,1fr) minmax(300px,.65fr); gap:22px; }}
@@ -747,14 +766,14 @@ def _page_template(*, history_html: str, latest_html: str, admin_token: str) -> 
         <div>
       <p class="eyebrow">Local/Admin Blueprint Studio</p>
       <h1>Zelvari App Factory</h1>
-      <p>Create monetization-ready app blueprints from a raw idea using automatic web research and your configured local LLM backend.</p>
-      <p class="scope"><strong>Agent online:</strong> local/admin-only web research · configured local LLM generation</p>
+      <p>Create monetization-ready app blueprints from a raw idea using Hermes live web research and authenticated OpenAI Codex OAuth generation.</p>
+      <p class="scope"><strong>Agent online:</strong> Hermes Agent live web search · OpenAI Codex OAuth generation</p>
       <p class="scope"><strong>Version 1 scope:</strong> this creates a monetization-ready blueprint, not a finished generated app. Markdown export only.</p>
       <div class="research-pipeline" aria-label="Research pipeline progress">
         <div class="pipeline-stage"><strong>Idea intake</strong><span>Capture the raw app opportunity.</span></div>
         <div class="pipeline-stage"><strong>Market scan</strong><span>Find pain and urgency signals.</span></div>
         <div class="pipeline-stage"><strong>Source review</strong><span>Surface cited evidence cards.</span></div>
-        <div class="pipeline-stage"><strong>Blueprint generation</strong><span>Use the configured local LLM.</span></div>
+        <div class="pipeline-stage"><strong>Blueprint generation</strong><span>Use the governed Hermes Codex session.</span></div>
         <div class="pipeline-stage"><strong>Export readiness</strong><span>Save locally and export Markdown only.</span></div>
       </div>
     </div>
@@ -765,7 +784,7 @@ def _page_template(*, history_html: str, latest_html: str, admin_token: str) -> 
       <textarea id="idea-input" name="idea" placeholder="Example: AI appointment recovery assistant for small clinics"></textarea>
       <button type="submit" data-idle-label="Research and create blueprint">Research and create blueprint</button>
       <p class="working-status" role="status" aria-live="polite"></p>
-      <p>Web research runs automatically for each submission, then the configured local AI service generates the blueprint.</p>
+      <p>Hermes live web research runs automatically for each submission, then the authenticated OpenAI Codex OAuth session generates the blueprint.</p>
     </form>
   </section>
   <section class="support-grid">
@@ -784,7 +803,7 @@ def _page_template(*, history_html: str, latest_html: str, admin_token: str) -> 
       button.setAttribute("aria-busy", "true");
       button.textContent = form.action.includes("/blueprints")
         ? "Researching live sources…"
-        : "Local AI is working…";
+        : "Codex OAuth is working…";
       const status = form.querySelector(".working-status");
       if (status) status.textContent = "Searching live sources, reviewing evidence, and generating your blueprint. This can take a minute.";
     }});
@@ -879,4 +898,7 @@ def _result_from_dict(data: dict[str, object]) -> BlueprintResult:
 
 
 if __name__ == "__main__":
-    run()
+    run(
+        host=os.getenv("ZELVARI_APP_FACTORY_HOST", "127.0.0.1"),
+        port=int(os.getenv("ZELVARI_APP_FACTORY_PORT") or os.getenv("PORT") or "8765"),
+    )

@@ -6,7 +6,7 @@ This repo is connected to:
 
 - Linear team: `ZEL`
 - GitHub repo: `ivanhermes777/loops`
-- Operator: Hermes-native Finn loop repair lane
+- Operator: Hermes Agent with authenticated OpenAI Codex OAuth
 - Final merge gate: Michael approves by reacting with 🚀 on a merge-ready PR comment
 
 ## Loop Workflow
@@ -35,9 +35,8 @@ This repository includes the local/admin-only **Zelvari App Factory** blueprint 
 Version 1 scope:
 
 - Creates monetization-ready app blueprints from a submitted idea.
-- Runs web research automatically for pain points, urgency angles, audience signals, and monetization opportunities.
-- Uses no-login web research for cited market evidence.
-- Uses the configured local LLM backend by default for blueprint generation.
+- Uses Hermes Agent live web search automatically for pain points, urgency angles, audience signals, and monetization opportunities.
+- Uses Hermes Agent with the authenticated OpenAI Codex OAuth session by default for blueprint generation.
 - Saves completed blueprints locally so they can be reopened from project history.
 - Exports completed blueprints as Markdown only.
 - Does **not** provide public signup/login, customer accounts, payment setup, deployment, PDF export, or generated app code.
@@ -60,38 +59,32 @@ If your local shell only exposes Python as `python3`, use:
 python3 -m loops_app.app_factory
 ```
 
-### Local LLM configuration
-
-The app uses an Ollama-compatible local generation endpoint by default. Start
-your local model service before submitting an idea:
+If port `8765` is already occupied, use the documented override:
 
 ```bash
-ollama serve
-ollama pull llama3.1
+ZELVARI_APP_FACTORY_PORT=8893 python3 -m loops_app.app_factory
 ```
 
-Default local AI settings:
+Then open:
 
 ```text
-ZELVARI_LOCAL_LLM_ENDPOINT=http://127.0.0.1:11434/api/generate
-ZELVARI_LOCAL_LLM_MODEL=llama3.1
-ZELVARI_LOCAL_LLM_TIMEOUT=180
+http://127.0.0.1:8893
 ```
 
-Optional web-research overrides:
+Optional host/port settings:
 
 ```text
-ZELVARI_RESEARCH_ENDPOINT=https://html.duckduckgo.com/html/
-ZELVARI_RESEARCH_TIMEOUT=20
+ZELVARI_APP_FACTORY_HOST=127.0.0.1
+ZELVARI_APP_FACTORY_PORT=8893
+ZELVARI_HERMES_COMMAND=hermes
+ZELVARI_HERMES_TIMEOUT=360
 ```
 
-If the configured local model/service is unavailable, the app pauses with a
-clear local-AI-backend error instead of crashing or requiring a cloud AI provider.
-If web research fails or returns weak results, the app shows a warning, preserves
-partial findings when available, and lets the admin retry or continue with
-clearly labeled AI-only suggestions.
+Hermes Agent must be installed and the OpenAI Codex OAuth session must already be authenticated in the local Hermes environment. If Hermes Agent or the Codex OAuth session is unavailable, the app pauses with a clear recovery message instead of crashing.
 
-Run a local generation smoke test:
+If web research fails or returns weak results, the app shows a warning, preserves partial findings when available, and lets the admin retry or continue with clearly labeled AI-only suggestions.
+
+Run a Hermes/Codex adapter smoke test:
 
 ```bash
 python3 bin/verify_hermes_runtime.py
